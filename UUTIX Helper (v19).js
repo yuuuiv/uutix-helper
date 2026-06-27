@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         UUTIX Helper (v17)
+// @name         UUTIX Helper (v19 API)
 // @namespace    http://tampermonkey.net/
-// @version      2026-06-26.17
-// @description  分步复查：适配新版 detail/ticket/cart/trade-confirmation/cashier DOM；进入支付页后按预设付款方法确认支付，卡号等敏感信息不写入本地存储。
+// @version      2026-06-27.19-api
+// @description  v18 DOM 续跑 + API 快路径：用接口完成选票、加购、建单、pay/token，失败时回退页面流程；不保存账号密码或卡号。
 // @author       yuuuiv
 // @license      MIT
 // @match        https://www.uutix.com/detail?pId=*
@@ -16,6 +16,8 @@
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_deleteValue
+// @grant        unsafeWindow
+// @run-at       document-start
 // ==/UserScript==
 
 (function () {
@@ -23,6 +25,9 @@
 
   let submitIntervalId = null;
   let entryObserver = null;
+  let domSignalObserver = null;
+  let domSignalVersion = 0;
+  const domSignalWaiters = new Set();
 
   let isRunning = false;
   let runToken = 0;
@@ -31,12 +36,13 @@
   const PANEL_HIDDEN_KEY = 'uutix-helper-panel-hidden';
   const AUTO_RUN_KEY = 'uutix-helper-auto-run-ticket';
   const TARGETS_KEY = 'uutix-helper-last-targets';
+  const API_PROBE_CONFIG_KEY = 'uutix-helper-api-probe-config-v19';
   const CART_SUBMIT_KEY = 'uutix-helper-auto-submit-cart';
   const PAY_NOW_KEY = 'uutix-helper-auto-pay-now';
-  const CROWD_RETRY_KEY = 'uutix-helper-crowd-retry-v17';
-  const PAYMENT_HANDOFF_MARK = 'uutix-helper-payment-handoff-v17';
-  const PAYMENT_METHOD_STORE_KEY = 'uutix-helper-payment-method-v17';
-  const CASHIER_AUTO_KEY = 'uutix-helper-auto-cashier-v17';
+  const CROWD_RETRY_KEY = 'uutix-helper-crowd-retry-v18';
+  const PAYMENT_HANDOFF_MARK = 'uutix-helper-payment-handoff-v18';
+  const PAYMENT_METHOD_STORE_KEY = 'uutix-helper-payment-method-v18';
+  const CASHIER_AUTO_KEY = 'uutix-helper-auto-cashier-v18';
   const ENTRY_CLICK_INTERVAL_MS = 35;
   const SUBMIT_CLICK_INTERVAL_MS = 12;
   const SUBMIT_BURST_CLICKS = 4;
@@ -54,9 +60,36 @@
   const CLICK_READY_WINDOW_MS = 1200;
   const PAY_NOW_CLICK_WINDOW_MS = 1500;
   const CASHIER_CONFIRM_CLICK_WINDOW_MS = 2000;
+  const CASHIER_AUTO_START_DELAY_MS = 0;
+  const AUTO_START_FALLBACK_MS = 1200;
+  const CASHIER_SELECT_RETRY_MS = 5000;
+  const CASHIER_SELECT_RETRY_INTERVAL_MS = 120;
   const CROWD_RETRY_MAX_ATTEMPTS = 8;
   const CROWD_RETRY_BASE_COOLDOWN_MS = 4200;
   const CROWD_RETRY_JITTER_MS = 1600;
+  const networkRecorder = {
+    installed: false,
+    recording: false,
+    records: [],
+    maxRecords: 800,
+    originalFetch: null,
+    originalXhrOpen: null,
+    originalXhrSetRequestHeader: null,
+    originalXhrSend: null
+  };
+  const apiSnapshots = {
+    updatedAt: null,
+    project: null,
+    shows: [],
+    tickets: [],
+    cart: null,
+    order: null,
+    payToken: null,
+    lastError: null
+  };
+  const pageWindow = (() => {
+    try { return typeof unsafeWindow !== 'undefined' ? unsafeWindow : window; } catch (_) { return window; }
+  })();
 
   const addStyle = (typeof GM_addStyle === 'function')
     ? GM_addStyle
@@ -220,6 +253,489 @@
     }
   }
 
+  function safeJsonParse(text) {
+    try { return JSON.parse(text); } catch (_) { return null; }
+  }
+
+  function redactSensitiveText(value) {
+    if (value == null) return value;
+    let text = String(value);
+    text = text.replace(/(authorization|cookie|set-cookie|payToken|paytoken|token|sign|mygsig|m-traceid|nonce|fingerprint|uuid|iuuid|cardNo|cardNumber|pan|cvv|cvc)["']?\s*[:=]\s*["']?([^"',&\s}]+)/gi, '$1:<redacted>');
+    text = text.replace(/([?&](?:payToken|paytoken|token|tradeNo|tradeno|orderId|orderid|sign|mygsig|m-traceid|nonce|s|uuid|iuuid)=)[^&#]+/gi, '$1<redacted>');
+    text = text.replace(/\b[A-Fa-f0-9]{24,}\b/g, '<hex-redacted>');
+    text = text.replace(/\b\d{12,19}\b/g, '<number-redacted>');
+    return text;
+  }
+
+  function redactUrl(url) {
+    try {
+      const u = new URL(String(url), location.href);
+      ['payToken', 'paytoken', 'token', 'tradeNo', 'tradeno', 'orderId', 'orderid', 'sign', 'nonce', 's', 'uuid'].forEach((key) => {
+        if (u.searchParams.has(key)) u.searchParams.set(key, '<redacted>');
+      });
+      return u.toString();
+    } catch (_) {
+      return redactSensitiveText(url);
+    }
+  }
+
+  function isUutixRelatedUrl(url) {
+    try {
+      const u = new URL(String(url), location.href);
+      return /uutix\.com|wxmovie\.com|wepayez\.com/i.test(u.hostname);
+    } catch (_) {
+      return /uutix|wxmovie|wepayez/i.test(String(url || ''));
+    }
+  }
+
+  function summarizeBody(body) {
+    if (body == null) return null;
+    if (typeof body === 'string') {
+      const trimmed = body.length > 3000 ? `${body.slice(0, 3000)}...<truncated>` : body;
+      const parsed = safeJsonParse(trimmed);
+      return parsed ? redactSensitiveObject(parsed) : redactSensitiveText(trimmed);
+    }
+    if (body instanceof URLSearchParams) return redactSensitiveText(body.toString());
+    if (body instanceof FormData) {
+      const out = {};
+      try {
+        body.forEach((value, key) => {
+          out[key] = value instanceof File ? `[File:${value.name || 'blob'}]` : redactSensitiveText(value);
+        });
+      } catch (_) {}
+      return out;
+    }
+    if (body instanceof Blob) return `[Blob:${body.type || 'unknown'},${body.size || 0}]`;
+    if (body instanceof ArrayBuffer) return `[ArrayBuffer:${body.byteLength}]`;
+    try { return redactSensitiveObject(body); } catch (_) { return `[${Object.prototype.toString.call(body)}]`; }
+  }
+
+  function summarizeHeaders(headers) {
+    if (!headers) return null;
+    const out = {};
+    try {
+      if (headers instanceof Headers) {
+        headers.forEach((value, key) => { out[key] = redactSensitiveText(value); });
+        return out;
+      }
+      if (Array.isArray(headers)) {
+        headers.forEach((pair) => {
+          if (Array.isArray(pair) && pair.length >= 2) out[pair[0]] = redactSensitiveText(pair[1]);
+        });
+        return out;
+      }
+      Object.keys(headers).forEach((key) => {
+        out[key] = redactSensitiveText(headers[key]);
+      });
+      return out;
+    } catch (_) {
+      return '[unreadable-headers]';
+    }
+  }
+
+  function redactSensitiveObject(input, depth = 0) {
+    if (input == null) return input;
+    if (depth > 5) return '[depth-limit]';
+    if (typeof input !== 'object') return redactSensitiveText(input);
+    if (Array.isArray(input)) return input.slice(0, 80).map((item) => redactSensitiveObject(item, depth + 1));
+    const out = {};
+    Object.keys(input).slice(0, 120).forEach((key) => {
+      const lower = key.toLowerCase();
+      if (/authorization|cookie|token|sign|mygsig|m-traceid|nonce|fingerprint|uuid|iuuid|card|cvv|cvc|pan/.test(lower)) {
+        out[key] = '<redacted>';
+      } else {
+        out[key] = redactSensitiveObject(input[key], depth + 1);
+      }
+    });
+    return out;
+  }
+
+  function recordNetworkEntry(entry) {
+    if (!networkRecorder.recording || !isUutixRelatedUrl(entry.url)) return;
+    captureApiSnapshot(entry);
+    const safeEntry = {
+      ts: new Date().toISOString(),
+      type: entry.type || 'request',
+      method: entry.method || 'GET',
+      url: redactUrl(entry.url),
+      status: entry.status ?? null,
+      durationMs: entry.durationMs ?? null,
+      requestHeaders: summarizeHeaders(entry.requestHeaders),
+      requestBody: summarizeBody(entry.requestBody),
+      responseBody: summarizeBody(entry.responseBody)
+    };
+    networkRecorder.records.push(safeEntry);
+    if (networkRecorder.records.length > networkRecorder.maxRecords) {
+      networkRecorder.records.splice(0, networkRecorder.records.length - networkRecorder.maxRecords);
+    }
+    logDebug(`记录请求 ${safeEntry.method} ${safeEntry.url}`, { status: safeEntry.status });
+    updateProbeStatusArea();
+  }
+
+  function installNetworkInterceptor() {
+    if (networkRecorder.installed) return;
+    networkRecorder.installed = true;
+
+    if (typeof pageWindow.fetch === 'function') {
+      networkRecorder.originalFetch = pageWindow.fetch.bind(pageWindow);
+      pageWindow.fetch = async function uutixFetchWrapper(input, init = {}) {
+        const started = Date.now();
+        const url = typeof input === 'string' ? input : input?.url;
+        const method = String(init?.method || input?.method || 'GET').toUpperCase();
+        const requestBody = init?.body;
+        const requestHeaders = init?.headers || input?.headers;
+        try {
+          const response = await networkRecorder.originalFetch(input, init);
+          if (networkRecorder.recording && isUutixRelatedUrl(url)) {
+            const cloned = response.clone();
+            cloned.text().then((text) => {
+              recordNetworkEntry({
+                type: 'fetch',
+                method,
+                url,
+                status: response.status,
+                durationMs: Date.now() - started,
+                requestHeaders,
+                requestBody,
+                responseBody: text
+              });
+            }).catch(() => {
+              recordNetworkEntry({
+                type: 'fetch',
+                method,
+                url,
+                status: response.status,
+                durationMs: Date.now() - started,
+                requestHeaders,
+                requestBody,
+                responseBody: '[unreadable]'
+              });
+            });
+          }
+          return response;
+        } catch (e) {
+          recordNetworkEntry({
+            type: 'fetch',
+            method,
+            url,
+            status: 'ERROR',
+            durationMs: Date.now() - started,
+            requestHeaders,
+            requestBody,
+            responseBody: e?.message || String(e)
+          });
+          throw e;
+        }
+      };
+    }
+
+    if (pageWindow.XMLHttpRequest?.prototype) {
+      networkRecorder.originalXhrOpen = pageWindow.XMLHttpRequest.prototype.open;
+      networkRecorder.originalXhrSetRequestHeader = pageWindow.XMLHttpRequest.prototype.setRequestHeader;
+      networkRecorder.originalXhrSend = pageWindow.XMLHttpRequest.prototype.send;
+      pageWindow.XMLHttpRequest.prototype.open = function uutixXhrOpen(method, url) {
+        this.__uutixRecorderMeta = {
+          method: String(method || 'GET').toUpperCase(),
+          url: String(url || ''),
+          headers: {}
+        };
+        return networkRecorder.originalXhrOpen.apply(this, arguments);
+      };
+      pageWindow.XMLHttpRequest.prototype.setRequestHeader = function uutixXhrSetRequestHeader(name, value) {
+        try {
+          if (!this.__uutixRecorderMeta) this.__uutixRecorderMeta = { headers: {} };
+          this.__uutixRecorderMeta.headers[String(name || '')] = String(value || '');
+        } catch (_) {}
+        return networkRecorder.originalXhrSetRequestHeader.apply(this, arguments);
+      };
+      pageWindow.XMLHttpRequest.prototype.send = function uutixXhrSend(body) {
+        const meta = this.__uutixRecorderMeta || {};
+        const started = Date.now();
+        const xhr = this;
+        try {
+          xhr.addEventListener('loadend', () => {
+            if (!networkRecorder.recording || !isUutixRelatedUrl(meta.url)) return;
+            let responseBody = '[unreadable]';
+            try {
+              if (!xhr.responseType || xhr.responseType === 'text' || xhr.responseType === 'json') {
+                responseBody = xhr.responseText || xhr.response;
+              } else {
+                responseBody = `[${xhr.responseType}]`;
+              }
+            } catch (_) {}
+            recordNetworkEntry({
+              type: 'xhr',
+              method: meta.method,
+              url: meta.url,
+              status: xhr.status,
+              durationMs: Date.now() - started,
+              requestHeaders: meta.headers,
+              requestBody: body,
+              responseBody
+            });
+          });
+        } catch (_) {}
+        return networkRecorder.originalXhrSend.apply(this, arguments);
+      };
+    }
+  }
+
+  function interceptNetworkRequests() {
+    installNetworkInterceptor();
+    return networkRecorder;
+  }
+
+  function startNetworkRecording() {
+    interceptNetworkRequests();
+    networkRecorder.records = [];
+    networkRecorder.recording = true;
+    updateStatus('已开始记录 UUTIX 相关请求（仅监听，不发送请求）', '#17a2b8');
+  }
+
+  function stopNetworkRecording() {
+    networkRecorder.recording = false;
+    updateStatus(`已停止记录，共 ${networkRecorder.records.length} 条`, '#6c757d');
+  }
+
+  function exportNetworkRecords() {
+    const payload = {
+      exportedAt: new Date().toISOString(),
+      page: redactUrl(location.href),
+      count: networkRecorder.records.length,
+      records: networkRecorder.records
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `uutix-network-redacted-${Date.now()}.json`;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => {
+      URL.revokeObjectURL(a.href);
+      a.remove();
+    }, 1000);
+    updateStatus(`已导出脱敏请求日志：${networkRecorder.records.length} 条`, '#28a745');
+  }
+
+  function getUrlPath(url) {
+    try { return new URL(String(url), location.href).pathname; } catch (_) { return String(url || ''); }
+  }
+
+  function normalizeApiTicket(ticket, index = 0) {
+    return {
+      position: index + 1,
+      projectTicketId: ticket?.projectTicketId ?? ticket?.ticketId ?? null,
+      ticketId: ticket?.projectTicketId ?? ticket?.ticketId ?? null,
+      projectId: ticket?.projectId ?? null,
+      showId: ticket?.showId ?? null,
+      ticketName: String(ticket?.ticketName || ticket?.projectTicketName || ''),
+      description: String(ticket?.description || ''),
+      ticketPrice: ticket?.ticketPrice ?? null,
+      sellPrice: ticket?.sellPrice ?? null,
+      maxBuyLimit: ticket?.maxBuyLimit ?? null,
+      minBuyLimit: ticket?.minBuyLimit ?? null,
+      currentAmount: ticket?.currentAmount ?? null,
+      hasInventory: ticket?.hasInventory ?? null,
+      stockStatus: ticket?.stockStatus ?? null,
+      buyLimited: ticket?.buyLimited ?? null
+    };
+  }
+
+  function normalizeApiShow(show, index = 0) {
+    return {
+      position: index + 1,
+      showId: show?.showId ?? null,
+      projectId: show?.projectId ?? null,
+      name: String(show?.name || ''),
+      startTime: show?.startTime ?? null,
+      startTimeDateFormatted: String(show?.startTimeDateFormatted || ''),
+      startTimeWeekFormatted: String(show?.startTimeWeekFormatted || ''),
+      startTimeTimeFormatted: String(show?.startTimeTimeFormatted || ''),
+      hasInventory: show?.hasInventory ?? null,
+      saleStatus: show?.saleStatus ?? null,
+      maxBuyLimit: show?.projectGroupMaxBuyLimit ?? show?.limitModel?.maxBuyLimit ?? null
+    };
+  }
+
+  function setApiSnapshot(key, value) {
+    apiSnapshots[key] = value;
+    apiSnapshots.updatedAt = new Date().toISOString();
+    apiSnapshots.lastError = null;
+  }
+
+  function captureApiSnapshot(entry) {
+    const path = getUrlPath(entry?.url);
+    if (!path || !entry?.responseBody) return;
+    const json = typeof entry.responseBody === 'string' ? safeJsonParse(entry.responseBody) : entry.responseBody;
+    if (!json || typeof json !== 'object') return;
+
+    const data = json.data;
+    if (/\/api\/oversea\/show\/list$/.test(path) && Array.isArray(data)) {
+      setApiSnapshot('shows', data.map(normalizeApiShow));
+      return;
+    }
+
+    if (/\/api\/oversea\/ticket\/list$/.test(path) && Array.isArray(data)) {
+      setApiSnapshot('tickets', data.map(normalizeApiTicket));
+      return;
+    }
+
+    if (/\/api\/oversea\/project\/(?:detail|base)$/.test(path) && data) {
+      setApiSnapshot('project', {
+        projectId: data.projectId ?? null,
+        name: String(data.name || ''),
+        ticketStatus: data.ticketStatus ?? null,
+        saleStatus: data.saleStatus ?? null,
+        seatType: data.seatType ?? data.seatTypeNew ?? null,
+        lowestPrice: data.lowestPrice ?? null,
+        showTimeRange: String(data.showTimeRange || '')
+      });
+      return;
+    }
+
+    if (/\/api\/oversea\/shopping\/addToCart$/.test(path)) {
+      setApiSnapshot('cart', {
+        ok: json.code === 200 || json.success === true,
+        code: json.code ?? null,
+        msg: String(json.msg || json.message || ''),
+        hasCartId: !!data?.shoppingCartData?.cartId,
+        hasPendingPayment: !!data?.pendingPaymentInfo
+      });
+      return;
+    }
+
+    if (/\/api\/oversea\/order\/createV3$/.test(path)) {
+      setApiSnapshot('order', {
+        ok: json.code === 200 || json.success === true,
+        code: json.code ?? null,
+        msg: String(json.msg || json.message || ''),
+        hasOrderId: !!data?.orderId
+      });
+      return;
+    }
+
+    if (/\/api\/oversea\/pay\/token$/.test(path)) {
+      setApiSnapshot('payToken', {
+        ok: json.code === 200 || json.success === true,
+        code: json.code ?? null,
+        msg: String(json.msg || json.message || ''),
+        hasTradeNo: !!data?.tradeNo,
+        hasPayToken: !!data?.payToken,
+        h5UrlHost: (() => {
+          try { return data?.h5Url ? new URL(data.h5Url).host : ''; } catch (_) { return ''; }
+        })(),
+        remainPayExpireTime: data?.remainPayExpireTime ?? null
+      });
+    }
+  }
+
+  async function fetchJsonReadOnly(path, params = {}) {
+    const url = new URL(path, location.origin);
+    Object.keys(params).forEach((key) => {
+      if (params[key] != null && params[key] !== '') url.searchParams.set(key, String(params[key]));
+    });
+    const response = await pageWindow.fetch(url.toString(), {
+      method: 'GET',
+      credentials: 'include',
+      headers: { accept: 'application/json, text/plain, */*' }
+    });
+    const text = await response.text();
+    const json = safeJsonParse(text);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    if (!json) throw new Error('接口未返回 JSON');
+    if (json.code != null && json.code !== 200) throw new Error(json.msg || `接口 code=${json.code}`);
+    return json;
+  }
+
+  function getPreferredShowIdFromState() {
+    return parseShowIdFromWrap(getSelectedSessionWrap()) ||
+      apiSnapshots.shows.find((show) => show.hasInventory)?.showId ||
+      apiSnapshots.shows[0]?.showId ||
+      null;
+  }
+
+  async function queryInventoryReadOnly() {
+    const projectId = getUrlParamValue(['pId', 'projectId']) || extractPageState().ids.projectId;
+    let showId = getPreferredShowIdFromState();
+
+    if (!projectId && !showId) {
+      updateStatus('库存查询失败：当前页面没有 projectId/showId', '#dc3545');
+      return null;
+    }
+
+    updateStatus('正在只读查询库存 API...', '#17a2b8');
+    try {
+      if (!showId && projectId) {
+        const showJson = await fetchJsonReadOnly('/api/oversea/show/list', {
+          t: Date.now(),
+          projectId,
+          WuKongReady: 'h5'
+        });
+        captureApiSnapshot({ url: '/api/oversea/show/list', responseBody: JSON.stringify(showJson) });
+        showId = getPreferredShowIdFromState();
+      }
+
+      if (!showId) throw new Error('未能确定 showId');
+
+      const ticketJson = await fetchJsonReadOnly('/api/oversea/ticket/list', {
+        t: Date.now(),
+        showId,
+        WuKongReady: 'h5'
+      });
+      captureApiSnapshot({ url: '/api/oversea/ticket/list', responseBody: JSON.stringify(ticketJson) });
+      showInventorySnapshot('只读 API 查询完成');
+      return apiSnapshots.tickets;
+    } catch (e) {
+      apiSnapshots.lastError = String(e?.message || e);
+      updateStatus(`只读库存 API 查询失败：${apiSnapshots.lastError}`, '#ff9800');
+      logDebug('只读库存 API 查询失败，可能缺少页面生成的 mygsig/uuid，改看已捕获快照', apiSnapshots.lastError);
+      showInventorySnapshot('只读 API 查询失败，显示已有快照');
+      return null;
+    }
+  }
+
+  function formatTicketInventory(ticket) {
+    const name = ticket.ticketName || ticket.name || `票档#${ticket.position}`;
+    const amount = ticket.currentAmount == null ? '?' : ticket.currentAmount;
+    const inventory = ticket.hasInventory === true ? '有库存' : ticket.hasInventory === false ? '无库存' : '未知';
+    const price = ticket.sellPrice == null ? '' : ` HK$${ticket.sellPrice}`;
+    return `#${ticket.position} ${name}${price} 库存:${amount} ${inventory} stockStatus:${ticket.stockStatus ?? '?'}`;
+  }
+
+  function showInventorySnapshot(prefix = '库存快照') {
+    const apiTickets = apiSnapshots.tickets || [];
+    const pageState = extractPageState();
+    const domTickets = pageState.tickets || [];
+
+    logDebug(prefix, {
+      updatedAt: apiSnapshots.updatedAt,
+      project: apiSnapshots.project,
+      shows: apiSnapshots.shows,
+      tickets: apiTickets,
+      cart: apiSnapshots.cart,
+      order: apiSnapshots.order,
+      payToken: apiSnapshots.payToken,
+      lastError: apiSnapshots.lastError
+    });
+    try {
+      if (apiTickets.length) console.table(apiTickets);
+      else if (domTickets.length) console.table(domTickets);
+    } catch (_) {}
+
+    if (apiTickets.length) {
+      const summary = apiTickets.slice(0, 2).map(formatTicketInventory).join(' | ');
+      updateStatus(`${prefix}: ${summary}${apiTickets.length > 2 ? ' ...' : ''}`, '#28a745');
+      return;
+    }
+
+    if (domTickets.length) {
+      updateStatus(`${prefix}: 暂无 API 库存，已在控制台输出 DOM 票档`, '#ffc107');
+      return;
+    }
+
+    updateStatus(`${prefix}: 暂无库存数据，请先记录请求或进入选票页`, '#ffc107');
+  }
+
   function isDisabled(el) {
     if (!el) return true;
     if (el.disabled) return true;
@@ -245,6 +761,63 @@
     }
   }
 
+  function signalDomChanged() {
+    domSignalVersion++;
+    const waiters = Array.from(domSignalWaiters);
+    domSignalWaiters.clear();
+    waiters.forEach((resolve) => {
+      try { resolve(); } catch (_) {}
+    });
+  }
+
+  function shouldIgnoreDomMutations(mutations) {
+    return mutations.length > 0 && mutations.every((mutation) => {
+      const target = mutation.target;
+      const el = target instanceof Element ? target : target?.parentElement;
+      return !!el?.closest?.('#uutix-helper-panel, #uutix-helper-dock');
+    });
+  }
+
+  function ensureDomSignalObserver() {
+    if (domSignalObserver || !document.documentElement || typeof MutationObserver !== 'function') return;
+    try {
+      domSignalObserver = new MutationObserver((mutations) => {
+        if (shouldIgnoreDomMutations(mutations)) return;
+        signalDomChanged();
+      });
+      domSignalObserver.observe(document.documentElement, {
+        subtree: true,
+        childList: true,
+        attributes: true,
+        characterData: true
+      });
+    } catch (_) {}
+  }
+
+  async function waitForDomOrTimeout(ms) {
+    if (!ms || ms <= 0) return;
+    ensureDomSignalObserver();
+    const seen = domSignalVersion;
+    if (!domSignalObserver) {
+      await sleep(ms);
+      return;
+    }
+    if (domSignalVersion !== seen) return;
+
+    await new Promise((resolve) => {
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        domSignalWaiters.delete(finish);
+        resolve();
+      };
+      const timer = setTimeout(finish, ms);
+      domSignalWaiters.add(finish);
+    });
+  }
+
   async function ensureNotStopped(token) {
     if (!isRunning || token !== runToken) throw new Error('已停止');
   }
@@ -256,7 +829,7 @@
       const v = fn();
       if (v) return v;
       if (Date.now() - t0 > timeoutMs) throw new Error(errMsg);
-      await sleep(intervalMs);
+      await waitForDomOrTimeout(intervalMs);
     }
   }
 
@@ -266,7 +839,7 @@
       await ensureNotStopped(token);
       if (condFn()) return true;
       if (Date.now() - t0 > timeoutMs) throw new Error(errMsg);
-      await sleep(intervalMs);
+      await waitForDomOrTimeout(intervalMs);
     }
   }
 
@@ -289,7 +862,7 @@
   async function waitLoadingStableGone(token, {
     appearWindowMs = 1600,
     disappearTimeoutMs = 25000,
-    stableGoneMs = 350
+    stableGoneMs = 180
   } = {}) {
     if (!getLoadingEl()) return;
 
@@ -370,7 +943,8 @@
     burstClicks,
     windowMs = CLICK_READY_WINDOW_MS,
     loadingAware = true,
-    label = '按钮'
+    label = '按钮',
+    shouldStop = null
   }) {
     let clicked = 0;
     let lastReadyAt = 0;
@@ -378,6 +952,11 @@
 
     while (Date.now() - t0 <= windowMs) {
       await ensureNotStopped(token);
+
+      if (shouldStop && shouldStop({ clicked, lastReadyAt })) {
+        logDebug(`${label}点击窗口提前结束`, { clicked, lastReadyAt });
+        return clicked;
+      }
 
       if (loadingAware && isLoadingVisible()) {
         await sleep(intervalMs);
@@ -392,6 +971,10 @@
 
       lastReadyAt = Date.now();
       clicked += burstClick(cur, burstClicks);
+      if (shouldStop && shouldStop({ clicked, lastReadyAt })) {
+        logDebug(`${label}点击后提前结束`, { clicked, lastReadyAt });
+        return clicked;
+      }
       await sleep(intervalMs);
     }
 
@@ -408,7 +991,7 @@
 
       if (isLoadingVisible()) {
         okStart = null;
-        await sleep(pollMs);
+        await waitForDomOrTimeout(pollMs);
         continue;
       }
 
@@ -420,7 +1003,7 @@
       }
 
       if (Date.now() - t0 > timeoutMs) throw new Error(errMsg);
-      await sleep(pollMs);
+      await waitForDomOrTimeout(pollMs);
     }
   }
 
@@ -520,7 +1103,7 @@
 
       if (isLoadingVisible()) {
         countStableSince = Date.now();
-        await sleep(pollMs);
+        await waitForDomOrTimeout(pollMs);
         continue;
       }
 
@@ -546,7 +1129,7 @@
         throw new Error('等待票价列表加载超时（列表仍为空）');
       }
 
-      await sleep(pollMs);
+      await waitForDomOrTimeout(pollMs);
     }
   }
   function getSelectedTicketWrap() {
@@ -854,6 +1437,50 @@
     return /確認支付|确认支付|立即支付|Pay/i.test(getText(btn)) || btn.classList?.contains('confirm-btn');
   }
 
+  function isWechatPaymentQrLoaded() {
+    if (!/mcashier\.uutix\.com/i.test(location.host) && !isCashierPaymentPage()) return false;
+    const bodyText = getText(document.body);
+    const hasQrContext = /微信.*(掃碼|扫码|二維碼|二维码)|WeChat.*(scan|QR)|掃碼支付|扫码支付|二維碼|二维码|QR\s*code/i.test(bodyText);
+    const candidates = Array.from(document.querySelectorAll([
+      'canvas',
+      'img',
+      'svg',
+      '[class*="qr"]',
+      '[class*="QR"]',
+      '[class*="Qr"]',
+      '[id*="qr"]',
+      '[id*="QR"]',
+      '[id*="Qr"]',
+      '[class*="qrcode"]',
+      '[id*="qrcode"]',
+      '[class*="pay-code"]',
+      '[id*="pay-code"]'
+    ].join(','))).filter(isVisible);
+
+    return candidates.some((el) => {
+      const rect = el.getBoundingClientRect();
+      const naturalWidth = Number(el.naturalWidth || el.width || rect.width || 0);
+      const naturalHeight = Number(el.naturalHeight || el.height || rect.height || 0);
+      const width = Math.max(Number(rect.width || 0), naturalWidth);
+      const height = Math.max(Number(rect.height || 0), naturalHeight);
+      if (width < 80 || height < 80) return false;
+      const ratio = width / Math.max(1, height);
+      if (ratio < 0.65 || ratio > 1.55) return false;
+
+      const marker = [
+        el.id,
+        el.className,
+        el.getAttribute('alt'),
+        el.getAttribute('title'),
+        el.getAttribute('src')
+      ].join(' ');
+      if (/qr|qrcode|pay-code|wechat|weixin|二維碼|二维码/i.test(marker)) return true;
+      if (/^(CANVAS|SVG)$/i.test(el.tagName) && hasQrContext) return true;
+      if (/^IMG$/i.test(el.tagName) && hasQrContext && (el.complete !== false)) return true;
+      return false;
+    });
+  }
+
   function isCashierPaymentPage() {
     const title = document.title || '';
     if (/mcashier\.uutix\.com/i.test(location.host)) return true;
@@ -861,10 +1488,35 @@
     return !!(getCashierRoot() && getCashierConfirmButton());
   }
 
+  function dismissPendingPaymentOverlay() {
+    const pendingRe = /待支付訂單|待支付订单|已有.*訂單|已有.*订单|存在.*訂單|存在.*订单/i;
+    const payRe = /前往付款區|前往付款区|去往付款區|去往付款区|前往支付|去支付|付款區|付款区|購物車|购物车/i;
+    const cancelRe = /取消原座位|取消.*座位|取消.*訂單|取消.*订单|釋放|释放|重新購買|重新购买/i;
+    const roots = Array.from(document.querySelectorAll('.van-dialog, .van-popup, .modal, .dialog, [role="dialog"], [class*="modal"], [class*="dialog"], [class*="popup"]'))
+      .filter((el) => pendingRe.test(getText(el)));
+    const root = roots.find(isVisible) || roots[0];
+    if (!root) return false;
+
+    const buttons = Array.from(root.querySelectorAll('button, [role="button"], .van-button, [class*="btn"], [class*="button"], a, div, span'))
+      .filter(isVisible)
+      .map((el) => ({ el, text: getText(el) }))
+      .filter((item) => item.text);
+    const cancelTarget = buttons.find((item) => cancelRe.test(item.text))?.el;
+    const payTarget = buttons.find((item) => payRe.test(item.text))?.el;
+    const target = cancelTarget || payTarget;
+    if (!target) return false;
+
+    setCartSubmitFlag(!cancelTarget);
+    setPayNowFlag(false);
+    dispatchPointerTap(target);
+    updateStatus(cancelTarget ? '发现待支付订单：已取消原座位，继续当前场次...' : '发现待支付订单：已点击前往付款区...', '#17a2b8');
+    return true;
+  }
+
   function getCashierPaymentItem(method) {
     const root = getCashierRoot() || document;
     const target = PAYMENT_METHODS[normalizePaymentMethod(method)];
-    const items = Array.from(root.querySelectorAll('.pay-type-item, [class*="pay-type-item"], [role="radio"], [role="button"]'));
+    const items = getCashierPaymentItems(root);
 
     const matched = items.filter((item) => {
       const title = item.querySelector('.pay-type-title, [class*="pay-type-title"]');
@@ -872,6 +1524,59 @@
     });
 
     return matched.find(isVisible) || matched[0] || null;
+  }
+
+  function getCashierPaymentItems(root = getCashierRoot() || document) {
+    return Array.from(root.querySelectorAll('.pay-type-item, [class~="pay-type-item"], [role="radio"], [role="button"]'))
+      .filter((item) => {
+        const className = String(item.className || '');
+        if (/pay-type-item-container/.test(className)) return false;
+        const txt = getText(item.querySelector('.pay-type-title, [class*="pay-type-title"]') || item);
+        return /VISA|萬事達|万事达|美國運通|美国运通|銀聯|银联|微信|AlipayHK|支付寶|支付宝|master|amex|unionpay|wechat|alipay/i.test(txt);
+      });
+  }
+
+  function getCashierActivePaymentItem() {
+    const root = getCashierRoot() || document;
+    const items = getCashierPaymentItems(root);
+    return items.find((item) =>
+      item.classList?.contains('active') ||
+      item.classList?.contains('selected') ||
+      item.getAttribute('aria-checked') === 'true' ||
+      item.getAttribute('data-selected') === 'true'
+    ) || null;
+  }
+
+  function isCashierPaymentItemSelected(item) {
+    if (!item) return false;
+    return item.classList?.contains('active') ||
+      item.classList?.contains('selected') ||
+      item.getAttribute('aria-checked') === 'true' ||
+      item.getAttribute('data-selected') === 'true';
+  }
+
+  function isCashierPaymentMethodSelected(method) {
+    const active = getCashierActivePaymentItem();
+    if (!active) return false;
+    const target = PAYMENT_METHODS[normalizePaymentMethod(method)];
+    return target.match.test(getText(active.querySelector('.pay-type-title, [class*="pay-type-title"]') || active));
+  }
+
+  function dispatchPointerTap(element) {
+    if (!element) return 0;
+    prepareClickTarget(element);
+    const eventTypes = ['pointerdown', 'mousedown', 'touchstart', 'pointerup', 'mouseup', 'touchend', 'click'];
+    let sent = 0;
+    for (const type of eventTypes) {
+      try {
+        const event = type.startsWith('touch')
+          ? new Event(type, { bubbles: true, cancelable: true })
+          : new MouseEvent(type, { bubbles: true, cancelable: true, view: window });
+        element.dispatchEvent(event);
+        sent++;
+      } catch (_) {}
+    }
+    return sent;
   }
 
   async function selectCashierPaymentMethod(token, method) {
@@ -884,26 +1589,45 @@
       `找不到支付方式：${getPaymentMethodLabel(normalized)}`
     );
 
-    const alreadyActive = item.classList?.contains('active') ||
-      item.classList?.contains('selected') ||
-      item.getAttribute('aria-checked') === 'true';
+    const t0 = Date.now();
+    let clicked = 0;
 
-    if (!alreadyActive) {
+    while (Date.now() - t0 <= CASHIER_SELECT_RETRY_MS) {
+      await ensureNotStopped(token);
+
+      const cur = getCashierPaymentItem(normalized) || item;
+      if (isCashierPaymentItemSelected(cur) || isCashierPaymentMethodSelected(normalized)) {
+        updateStatus(`支付页：已选择 ${getPaymentMethodLabel(normalized)} ✅`, '#28a745');
+        logDebug('支付方式已选中', { method: normalized, clicked });
+        return true;
+      }
+
       updateStatus(`支付页：选择 ${getPaymentMethodLabel(normalized)}...`, '#17a2b8');
-      try { item.scrollIntoView({ block: 'center', inline: 'center' }); } catch (_) {}
-      burstClick(item, 1);
-      await sleep(80);
+      clicked += burstClick(cur, 1);
+      dispatchPointerTap(cur);
+      await sleep(CASHIER_SELECT_RETRY_INTERVAL_MS);
     }
 
-    return true;
+    if (isCashierPaymentMethodSelected(normalized)) return true;
+    const activeText = getText(getCashierActivePaymentItem());
+    throw new Error(`支付方式未切换到 ${getPaymentMethodLabel(normalized)}（当前：${activeText || '未知'}）`);
   }
 
   async function clickCashierConfirmPay(token, {
     waitButtonMs = 15000,
-    burstWindowMs = CASHIER_CONFIRM_CLICK_WINDOW_MS
+    burstWindowMs = CASHIER_CONFIRM_CLICK_WINDOW_MS,
+    method = null
   } = {}) {
+    const normalizedMethod = normalizePaymentMethod(method || getPaymentSettingsForCurrentPage().paymentMethod);
+    const stopOnWechatQr = normalizedMethod === 'wechat';
+    if (stopOnWechatQr && isWechatPaymentQrLoaded()) {
+      updateStatus('微信支付二维码已加载：停止重复点击確認支付', '#28a745');
+      return true;
+    }
+
     const btn = await waitFor(
       () => {
+        if (stopOnWechatQr && isWechatPaymentQrLoaded()) return true;
         const cur = getCashierConfirmButton();
         return isCashierConfirmReady(cur) ? cur : null;
       },
@@ -912,6 +1636,11 @@
       18,
       '找不到可点击的確認支付按钮'
     );
+
+    if (stopOnWechatQr && isWechatPaymentQrLoaded()) {
+      updateStatus('微信支付二维码已加载：停止重复点击確認支付', '#28a745');
+      return true;
+    }
 
     updateStatus('支付页：点击確認支付...', '#007bff');
 
@@ -922,8 +1651,14 @@
       intervalMs: CASHIER_CONFIRM_INTERVAL_MS,
       burstClicks: CASHIER_CONFIRM_BURST_CLICKS,
       windowMs: burstWindowMs,
-      label: '確認支付'
+      label: '確認支付',
+      shouldStop: ({ clicked: clickedCount }) => stopOnWechatQr && clickedCount > 0 && isWechatPaymentQrLoaded()
     });
+
+    if (stopOnWechatQr && isWechatPaymentQrLoaded()) {
+      updateStatus(`微信支付二维码已加载：已停止重复点击確認支付（${clicked}次）`, '#28a745');
+      return true;
+    }
 
     if (clicked > 0) {
       updateStatus(`已点击確認支付 ✅（${clicked}次）`, '#28a745');
@@ -1169,7 +1904,7 @@
       await fillCardPaymentForm(token, settings, 2500);
     }
 
-    await clickCashierConfirmPay(token);
+    await clickCashierConfirmPay(token, { method });
 
     if (isCardPaymentMethod(method)) {
       await fillCardPaymentForm(token, settings, 18000);
@@ -1227,6 +1962,12 @@
       // 如果直接进了交易預覽页，交给后续支付流程处理。
       if (isTradePreviewPage()) return 'preview';
       if (isCrowdLimitPage()) return 'crowd';
+
+      if (dismissPendingPaymentOverlay()) {
+        lastKeepClick = Date.now();
+        await sleep(Math.max(120, pollMs));
+        continue;
+      }
 
       // 如果已经跳到购物车，稳定确认
       if (isInShoppingCartPage()) {
@@ -1417,7 +2158,7 @@
         if (c2 && isVisible(c2)) checked.click();
 
         updateStatus('切换场次：等待 loading 稳定结束...', '#ffc107');
-        await waitLoadingStableGone(token, { stableGoneMs: 320 });
+        await waitLoadingStableGone(token, { stableGoneMs: 160 });
       },
       async () => {
         return await waitCondStable(() => {
@@ -1428,7 +2169,7 @@
           const selText = getText(selWrap);
           if (targetSessionText) return selText.includes(targetSessionText) || targetSessionText.includes(selText);
           return !!selId || !!selText;
-        }, token, 120, 3500, 16, '场次稳定确认超时');
+        }, token, 80, 3500, 16, '场次稳定确认超时');
       },
       { maxRetry: 60, betweenMs: 35 }
     );
@@ -1481,7 +2222,7 @@
           const selText = getText(selWrap);
           if (targetTicketText) return selText.includes(targetTicketText) || targetTicketText.includes(selText);
           return !!selId || !!selText;
-        }, token, 110, 3200, 16, '票价稳定确认超时');
+        }, token, 70, 3200, 16, '票价稳定确认超时');
       },
       { maxRetry: 80, betweenMs: 25 }
     );
@@ -1502,7 +2243,7 @@
       await waitCondStable(() => {
         const n = getQuantityNumber();
         return n === 1 || n === null;
-      }, token, 80, 2000, 20, '数量=1 确认超时');
+      }, token, 60, 2000, 20, '数量=1 确认超时');
       return { quantity };
     }
 
@@ -1526,7 +2267,7 @@
           const n = getQuantityNumber();
           if (n === null) return true;
           return n === quantity;
-        }, token, 100, 3200, 16, '数量稳定确认超时');
+        }, token, 70, 3200, 16, '数量稳定确认超时');
       },
       { maxRetry: 90, betweenMs: 20 }
     );
@@ -1711,6 +2452,641 @@
     return panelSettings;
   }
 
+  function getUrlParamValue(names) {
+    const params = new URLSearchParams(location.search || '');
+    for (const name of names) {
+      const value = params.get(name);
+      if (value) return value;
+    }
+    return null;
+  }
+
+  function extractTicketWrapState(wrap, index) {
+    if (!wrap) return null;
+    const item = wrap.querySelector('.item') || wrap;
+    return {
+      position: index + 1,
+      ticketId: parseTicketIdFromWrap(wrap),
+      name: getText(wrap.querySelector('.first-floor, [class*="first-floor"]') || wrap),
+      detail: getText(wrap.querySelector('.second-floor, [class*="second-floor"]') || wrap),
+      stateText: getTicketStateText(wrap),
+      unavailable: isTicketUnavailable(wrap),
+      temporaryNoTicket: isTicketTemporaryNoTicket(wrap),
+      selected: item?.classList?.contains('selected') || wrap.contains(getSelectedTicketWrap())
+    };
+  }
+
+  function extractPageState() {
+    const sessionItems = getSessionItems(getSessionContainerVisible() || getSessionDropdown())
+      .filter((item) => !item.closest('#uutix-helper-panel'));
+    const selectedSession = getSelectedSessionWrap();
+    const priceWraps = getPriceWraps(getPriceList());
+    const targets = readTargetsFromPanel();
+    const cashierParams = new URLSearchParams(location.search || '');
+    const cashierQueryKeys = Array.from(cashierParams.keys()).filter(Boolean);
+
+    return {
+      capturedAt: new Date().toISOString(),
+      page: {
+        host: location.host,
+        path: location.pathname,
+        url: redactUrl(location.href),
+        title: document.title || ''
+      },
+      ids: {
+        projectId: getUrlParamValue(['pId', 'projectId']),
+        performanceId: getUrlParamValue(['performance_id', 'performanceId']),
+        selectedShowId: parseShowIdFromWrap(selectedSession),
+        selectedTicketId: parseTicketIdFromWrap(getSelectedTicketWrap()),
+        orderIdInUrl: getUrlParamValue(['orderId', 'orderid'])
+      },
+      target: {
+        sessionPosition: targets.sessionPosition,
+        pricePosition: targets.pricePosition,
+        quantity: targets.quantity,
+        paymentMethod: targets.paymentMethod,
+        rushReturn: targets.rushReturn,
+        rushIntervalMs: targets.rushIntervalMs
+      },
+      sessions: sessionItems.slice(0, 50).map((item, index) => {
+        const wrap = item.closest('.item-wrap') || item;
+        return {
+          position: index + 1,
+          showId: parseShowIdFromWrap(wrap),
+          text: getText(wrap),
+          selected: wrap === selectedSession || wrap.contains(selectedSession)
+        };
+      }),
+      tickets: priceWraps.slice(0, 80).map(extractTicketWrapState),
+      quantity: {
+        current: getQuantityNumber(),
+        limit: getTicketLimit()
+      },
+      cashier: isCashierPaymentPage() ? {
+        queryKeys: cashierQueryKeys,
+        hasPayToken: cashierParams.has('payToken') || cashierParams.has('paytoken'),
+        hasTradeNo: cashierParams.has('tradeNo') || cashierParams.has('tradeno'),
+        paymentItems: getCashierPaymentItems().map((item) => ({
+          text: getText(item),
+          selected: isCashierPaymentItemSelected(item)
+        }))
+      } : null,
+      recentNetwork: networkRecorder.records.slice(-20)
+    };
+  }
+
+  function detectPageType() {
+    if (isCashierPaymentPage()) return 'cashier';
+    if (isCrowdLimitPage()) return 'crowd-limit';
+    if (isTradePreviewPage()) return 'trade-confirmation';
+    if (isInShoppingCartPage()) return 'shopping-cart';
+    if (isTicketSelectionPage()) return 'ticket-selection';
+    if (/\/detail/i.test(location.pathname)) return 'detail';
+    if (/\/list/i.test(location.pathname)) return 'list';
+    return 'unknown';
+  }
+
+  function extractEventInfoFromDOM() {
+    const titleCandidates = [
+      document.querySelector('.detail__info-title, [class*="detail__info-title"]'),
+      document.querySelector('.project-name, [class*="project-name"]'),
+      document.querySelector('h1'),
+      document.querySelector('title')
+    ].filter(Boolean);
+    const venueEl = findByText(['div', 'span', 'p'], /場館|场馆|Venue|地址|Address/i) ||
+      document.querySelector('[class*="venue"], [class*="address"]');
+
+    return {
+      projectId: getUrlParamValue(['pId', 'projectId']) || apiSnapshots.project?.projectId || null,
+      name: getText(titleCandidates[0]) || apiSnapshots.project?.name || document.title || null,
+      venue: getText(venueEl) || null,
+      url: redactUrl(location.href),
+      pageType: detectPageType(),
+      source: 'dom'
+    };
+  }
+
+  function extractSessionListFromDOM() {
+    const sessionItems = getSessionItems(getSessionContainerVisible() || getSessionDropdown());
+    return sessionItems.slice(0, 80).map((item, index) => {
+      const wrap = item.closest('.item-wrap') || item;
+      return {
+        position: index + 1,
+        showId: parseShowIdFromWrap(wrap),
+        name: getText(wrap),
+        time: getText(wrap),
+        selected: wrap === getSelectedSessionWrap() || wrap.contains(getSelectedSessionWrap()),
+        source: 'dom'
+      };
+    });
+  }
+
+  function extractTicketTierListFromDOM() {
+    return getPriceWraps(getPriceList()).slice(0, 80).map((wrap, index) => ({
+      ...extractTicketWrapState(wrap, index),
+      source: 'dom'
+    }));
+  }
+
+  function extractSelectedStateFromDOM() {
+    const session = getSelectedSessionWrap();
+    const ticket = getSelectedTicketWrap();
+    return {
+      session: session ? {
+        showId: parseShowIdFromWrap(session),
+        text: getText(session)
+      } : null,
+      ticketTier: ticket ? extractTicketWrapState(ticket, 0) : null,
+      quantity: getQuantityNumber(),
+      source: 'dom'
+    };
+  }
+
+  function extractEmbeddedScriptState() {
+    const out = {
+      source: 'embedded-script',
+      jsonBlocks: [],
+      uncertainty: []
+    };
+    const scripts = Array.from(document.querySelectorAll('script'))
+      .filter((script) => !script.closest('#uutix-helper-panel'))
+      .slice(0, 80);
+
+    scripts.forEach((script, index) => {
+      const type = String(script.type || '').toLowerCase();
+      const text = String(script.textContent || '').trim();
+      if (!text) return;
+      if (type.includes('json')) {
+        const parsed = safeJsonParse(text);
+        if (parsed) {
+          out.jsonBlocks.push({
+            index,
+            type,
+            keys: Object.keys(parsed).slice(0, 30)
+          });
+          return;
+        }
+      }
+      if (/projectId|showId|ticketId|stock|inventory|price/i.test(text)) {
+        out.uncertainty.push({
+          index,
+          type: type || 'script',
+          matchedKeywords: ['project/show/ticket/stock/price'],
+          note: '脚本文本包含候选字段，但未安全解析为 JSON'
+        });
+      }
+    });
+    return out;
+  }
+
+  function walkJson(value, visit, path = []) {
+    if (value == null) return;
+    visit(value, path);
+    if (Array.isArray(value)) {
+      value.forEach((item, index) => walkJson(item, visit, path.concat(index)));
+      return;
+    }
+    if (typeof value === 'object') {
+      Object.keys(value).forEach((key) => walkJson(value[key], visit, path.concat(key)));
+    }
+  }
+
+  function scoreObjectForKeys(obj, groups) {
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return 0;
+    const keys = Object.keys(obj).map((key) => key.toLowerCase());
+    return groups.reduce((score, group) => score + (group.some((pattern) => keys.some((key) => pattern.test(key))) ? 1 : 0), 0);
+  }
+
+  function extractShowsFromApiResponse(json, source = 'api') {
+    const candidates = [];
+    walkJson(json, (value, path) => {
+      if (!Array.isArray(value)) return;
+      const first = value.find((item) => item && typeof item === 'object' && !Array.isArray(item));
+      if (!first) return;
+      const score = scoreObjectForKeys(first, [
+        [/showid|sessionid|performanceid/],
+        [/starttime|time|date/],
+        [/inventory|stock|sale/]
+      ]);
+      if (score >= 2) {
+        candidates.push({
+          confidence: score / 3,
+          source,
+          path: path.join('.'),
+          items: value.map(normalizeApiShow)
+        });
+      }
+    });
+    return candidates;
+  }
+
+  function extractTicketsFromApiResponse(json, source = 'api') {
+    const candidates = [];
+    walkJson(json, (value, path) => {
+      if (!Array.isArray(value)) return;
+      const first = value.find((item) => item && typeof item === 'object' && !Array.isArray(item));
+      if (!first) return;
+      const score = scoreObjectForKeys(first, [
+        [/ticketid|projectticketid|skuid/],
+        [/price|sellprice/],
+        [/inventory|stock|amount|remain|count/],
+        [/limit|min|max/]
+      ]);
+      if (score >= 2) {
+        candidates.push({
+          confidence: score / 4,
+          source,
+          path: path.join('.'),
+          items: value.map(normalizeApiTicket),
+          uncertainty: score < 4 ? '字段名为推断匹配，需结合 endpoint 验证' : null
+        });
+      }
+    });
+    return candidates;
+  }
+
+  function extractInventoryFromApiResponse(json, source = 'api') {
+    return {
+      shows: extractShowsFromApiResponse(json, source),
+      tickets: extractTicketsFromApiResponse(json, source),
+      generatedAt: new Date().toISOString()
+    };
+  }
+
+  function extractOrderCandidateFromRequest(record) {
+    const body = typeof record?.requestBody === 'string'
+      ? safeJsonParse(record.requestBody)
+      : record?.requestBody;
+    const endpoint = record?.url || '';
+    const bodyKeys = body && typeof body === 'object' ? Object.keys(body) : [];
+    const dynamicOrRiskFields = [];
+    walkJson(body, (_, path) => {
+      const key = String(path[path.length - 1] || '');
+      if (/risk|fingerprint|uuid|token|sign|nonce|csrf|mygsig|trace/i.test(key)) {
+        dynamicOrRiskFields.push(path.join('.'));
+      }
+    });
+    return {
+      endpoint,
+      method: record?.method || '',
+      bodyKeys,
+      payloadCandidate: redactSensitiveObject(body || {}),
+      dynamicOrRiskFields: Array.from(new Set(dynamicOrRiskFields)),
+      source: 'captured-request'
+    };
+  }
+
+  function getTextMatchScore(text, keyword) {
+    const a = normalizeText(text);
+    const b = normalizeText(keyword);
+    if (!b) return 1;
+    if (!a) return 0;
+    if (a === b) return 1;
+    if (a.includes(b) || b.includes(a)) return 0.8;
+    return 0;
+  }
+
+  function loadTargetConfig() {
+    const fallback = (() => {
+      try { return JSON.parse(localStorage.getItem(API_PROBE_CONFIG_KEY) || '{}'); } catch (_) { return {}; }
+    })();
+    const read = (id, key = id) => String(document.getElementById(id)?.value ?? fallback[key] ?? '').trim();
+    const checked = (id, key = id, def = false) => {
+      const el = document.getElementById(id);
+      if (el) return !!el.checked;
+      return fallback[key] == null ? def : !!fallback[key];
+    };
+    return {
+      eventKeyword: read('target-event-keyword', 'eventKeyword'),
+      sessionKeyword: read('target-session-keyword', 'sessionKeyword'),
+      ticketKeyword: read('target-ticket-keyword', 'ticketKeyword'),
+      targetPrice: read('target-price', 'targetPrice'),
+      quantity: parseInt(document.getElementById('ticket-quantity')?.value || fallback.quantity || '1', 10) || 1,
+      apiProbeEnabled: checked('api-probe-enabled', 'apiProbeEnabled', true),
+      apiFastPath: checked('api-fast-path-enabled', 'apiFastPath', true),
+      dryRunEnabled: checked('dry-run-enabled', 'dryRunEnabled', true),
+      allowNativeSubmit: checked('native-submit-enabled', 'allowNativeSubmit', false),
+      recordRequests: checked('request-record-enabled', 'recordRequests', false)
+    };
+  }
+
+  function saveTargetConfig() {
+    try { localStorage.setItem(API_PROBE_CONFIG_KEY, JSON.stringify(loadTargetConfig())); } catch (_) {}
+  }
+
+  function restoreTargetConfig() {
+    let cfg = {};
+    try { cfg = JSON.parse(localStorage.getItem(API_PROBE_CONFIG_KEY) || '{}'); } catch (_) {}
+    const setValue = (id, key) => {
+      const el = document.getElementById(id);
+      if (el && cfg[key] != null) el.value = String(cfg[key]);
+    };
+    const setChecked = (id, key, def) => {
+      const el = document.getElementById(id);
+      if (el) el.checked = cfg[key] == null ? def : !!cfg[key];
+    };
+    setValue('target-event-keyword', 'eventKeyword');
+    setValue('target-session-keyword', 'sessionKeyword');
+    setValue('target-ticket-keyword', 'ticketKeyword');
+    setValue('target-price', 'targetPrice');
+    setChecked('api-probe-enabled', 'apiProbeEnabled', true);
+    setChecked('api-fast-path-enabled', 'apiFastPath', true);
+    setChecked('dry-run-enabled', 'dryRunEnabled', true);
+    setChecked('native-submit-enabled', 'allowNativeSubmit', false);
+    setChecked('request-record-enabled', 'recordRequests', false);
+  }
+
+  function matchTargetEvent(event, config = loadTargetConfig()) {
+    const score = getTextMatchScore(event?.name || '', config.eventKeyword);
+    return { matched: score > 0, score, event, reason: score > 0 ? [] : ['活动关键词不匹配或缺失'] };
+  }
+
+  function matchTargetSession(sessions, config = loadTargetConfig()) {
+    const candidates = (sessions || []).map((session) => ({
+      ...session,
+      score: Math.max(
+        getTextMatchScore(session.name || session.text || '', config.sessionKeyword),
+        getTextMatchScore(session.time || '', config.sessionKeyword)
+      )
+    })).filter((item) => item.score > 0);
+    return {
+      matched: candidates.length === 1,
+      candidates,
+      reason: candidates.length === 1 ? [] : [candidates.length ? '多个场次候选，需要人工确认' : '没有匹配场次']
+    };
+  }
+
+  function matchTargetTicketTier(tiers, config = loadTargetConfig()) {
+    const priceTarget = String(config.targetPrice || '').replace(/[^\d.]/g, '');
+    const candidates = (tiers || []).map((tier) => {
+      const nameScore = getTextMatchScore(tier.ticketName || tier.name || tier.detail || '', config.ticketKeyword);
+      const price = String(tier.sellPrice ?? tier.ticketPrice ?? tier.price ?? tier.detail ?? '').replace(/[^\d.]/g, '');
+      const priceScore = priceTarget ? (price === priceTarget ? 1 : 0) : 1;
+      return { ...tier, score: Math.min(nameScore || (config.ticketKeyword ? 0 : 1), priceScore) };
+    }).filter((item) => item.score > 0);
+    return {
+      matched: candidates.length === 1,
+      candidates,
+      reason: candidates.length === 1 ? [] : [candidates.length ? '多个票档候选或同价票档，需要人工确认' : '没有匹配票档']
+    };
+  }
+
+  function validateQuantity(ticketTier, quantity) {
+    const q = Math.max(1, parseInt(quantity, 10) || 1);
+    const max = parseInt(ticketTier?.maxBuyLimit ?? ticketTier?.limit ?? '', 10);
+    const currentAmount = parseInt(ticketTier?.currentAmount ?? '', 10);
+    const reasons = [];
+    if (Number.isFinite(max) && q > max) reasons.push(`数量超过限购 ${max}`);
+    if (Number.isFinite(currentAmount) && q > currentAmount) reasons.push(`数量超过可见库存 ${currentAmount}`);
+    if (ticketTier?.hasInventory === false) reasons.push('目标票档显示无库存');
+    return { valid: reasons.length === 0, quantity: q, reason: reasons };
+  }
+
+  function validatePurchaseTarget(snapshot = buildInventorySnapshot(), config = loadTargetConfig()) {
+    const eventMatch = matchTargetEvent(snapshot.event, config);
+    const sessionMatch = matchTargetSession(snapshot.sessions, config);
+    const ticketMatch = matchTargetTicketTier(snapshot.ticketTiers, config);
+    const quantityCheck = validateQuantity(ticketMatch.candidates[0], config.quantity);
+    const reasons = [
+      ...eventMatch.reason,
+      ...sessionMatch.reason,
+      ...ticketMatch.reason,
+      ...quantityCheck.reason
+    ];
+    return {
+      valid: eventMatch.matched && sessionMatch.matched && ticketMatch.matched && quantityCheck.valid,
+      eventMatch,
+      sessionMatch,
+      ticketMatch,
+      quantityCheck,
+      reason: reasons
+    };
+  }
+
+  function buildInventorySnapshot() {
+    const domEvent = extractEventInfoFromDOM();
+    const domSessions = extractSessionListFromDOM();
+    const domTickets = extractTicketTierListFromDOM();
+    const event = apiSnapshots.project ? { ...domEvent, ...apiSnapshots.project, source: 'api+dom' } : domEvent;
+    const sessions = (apiSnapshots.shows && apiSnapshots.shows.length)
+      ? apiSnapshots.shows.map((show) => ({ ...show, source: 'api' }))
+      : domSessions;
+    const ticketTiers = (apiSnapshots.tickets && apiSnapshots.tickets.length)
+      ? apiSnapshots.tickets.map((ticket) => ({ ...ticket, source: 'api' }))
+      : domTickets;
+    const inventoryEvidence = [
+      apiSnapshots.tickets?.length ? { source: 'api', endpoint: '/ticket/list', count: apiSnapshots.tickets.length } : null,
+      domTickets.length ? { source: 'dom', count: domTickets.length } : null,
+      apiSnapshots.cart ? { source: 'api', endpoint: 'addToCart', summary: apiSnapshots.cart } : null,
+      apiSnapshots.order ? { source: 'api', endpoint: 'order/createV3', summary: apiSnapshots.order } : null
+    ].filter(Boolean);
+
+    return {
+      event,
+      sessions,
+      ticketTiers,
+      selected: extractSelectedStateFromDOM(),
+      embeddedScriptState: extractEmbeddedScriptState(),
+      inventoryEvidence,
+      source: apiSnapshots.tickets?.length ? 'api' : domTickets.length ? 'dom' : 'unknown',
+      generatedAt: new Date().toISOString()
+    };
+  }
+
+  function buildPurchaseCandidateDryRun() {
+    const config = loadTargetConfig();
+    const snapshot = buildInventorySnapshot();
+    const validation = validatePurchaseTarget(snapshot, config);
+    const capturedCandidates = networkRecorder.records
+      .filter((record) => /addToCart|order\/createV3|pay\/token|submitPay/i.test(record.url))
+      .slice(-8)
+      .map(extractOrderCandidateFromRequest);
+    const ticket = validation.ticketMatch.candidates[0] || snapshot.ticketTiers[0] || {};
+    const price = Number(ticket.sellPrice ?? ticket.ticketPrice ?? NaN);
+    const dynamicOrRiskFields = Array.from(new Set(capturedCandidates.flatMap((item) => item.dynamicOrRiskFields || [])));
+    const missingRequiredFields = validation.reason.slice();
+    if (!capturedCandidates.length) missingRequiredFields.push('尚未捕获 addToCart/order/createV3/pay/token 请求');
+    if (!dynamicOrRiskFields.length) dynamicOrRiskFields.push('mygsig', 'uuid', 'fingerprint', 'x-csrf-token');
+    return {
+      accountMasked: extractAccountMasked(),
+      event: validation.eventMatch.event || snapshot.event,
+      session: validation.sessionMatch.candidates[0] || null,
+      ticketTier: validation.ticketMatch.candidates[0] || null,
+      quantity: config.quantity,
+      price: Number.isFinite(price) ? price : null,
+      totalPrice: Number.isFinite(price) ? price * config.quantity : null,
+      possibleEndpoints: capturedCandidates.map((item) => item.endpoint),
+      payloadCandidate: capturedCandidates[0]?.payloadCandidate || {},
+      missingRequiredFields,
+      dynamicOrRiskFields,
+      feasibility: 'B',
+      reason: [
+        '读取库存/场次/票档可以 API 辅助',
+        '加购/建单/支付 token 依赖页面生成的 mygsig、Rohr fingerprint 或 CSRF',
+        '本 dry-run 不发送创建订单请求'
+      ],
+      validation,
+      inventorySnapshot: snapshot,
+      generatedAt: new Date().toISOString()
+    };
+  }
+
+  function extractAccountMasked() {
+    const text = getText(document.querySelector('[class*="user"], [class*="account"], [class*="avatar"]')) || '';
+    if (!text) return 'unknown';
+    return text.replace(/(.{1,2}).*(.{1,2})/, '$1***$2');
+  }
+
+  function updateProbeStatusArea() {
+    const summaryEl = document.getElementById('probe-summary-display');
+    const recentEl = document.getElementById('recent-requests-display');
+    const feasibilityEl = document.getElementById('feasibility-display');
+    if (!summaryEl && !recentEl && !feasibilityEl) return;
+
+    const snapshot = buildInventorySnapshot();
+    const validation = validatePurchaseTarget(snapshot);
+    if (summaryEl) {
+      const firstTicket = snapshot.ticketTiers[0];
+      summaryEl.textContent = [
+        `页面: ${detectPageType()}`,
+        `账号: ${extractAccountMasked()}`,
+        `活动: ${snapshot.event?.name || 'unknown'}`,
+        `场次: ${snapshot.sessions.length}`,
+        `票档: ${snapshot.ticketTiers.length}`,
+        firstTicket ? `首票档库存: ${firstTicket.currentAmount ?? firstTicket.stateText ?? 'unknown'}` : '库存: unknown',
+        `匹配: ${validation.valid ? '通过' : validation.reason.join('；') || '待配置'}`
+      ].join('\n');
+    }
+    if (recentEl) {
+      recentEl.textContent = networkRecorder.records.slice(-5)
+        .map((record) => `${record.method} ${getUrlPath(record.url)} ${record.status ?? ''}`)
+        .join('\n') || '暂无请求';
+    }
+    if (feasibilityEl) {
+      feasibilityEl.textContent = '可行性: B（API 读取 + 页面原生提交）';
+    }
+  }
+
+  async function executeNativeNextStep() {
+    const config = loadTargetConfig();
+    if (!config.allowNativeSubmit) {
+      updateStatus('未启用“允许页面原生提交”，不会点击下一步', '#ff9800');
+      return false;
+    }
+    if (isCashierPaymentPage()) {
+      updateStatus('已在支付页：为避免自动支付，不点击確認支付', '#dc3545');
+      return false;
+    }
+    const snapshot = buildInventorySnapshot();
+    const candidate = buildPurchaseCandidateDryRun();
+    const ok = confirm([
+      '将点击页面原生下一步按钮。',
+      '脚本不会构造隐藏请求，也不会自动支付。',
+      `活动：${snapshot.event?.name || 'unknown'}`,
+      `数量：${candidate.quantity}`,
+      `可行性：${candidate.feasibility}`,
+      '确认继续？'
+    ].join('\n'));
+    if (!ok) return false;
+
+    const btn = isTradePreviewPage()
+      ? getPayNowButton()
+      : isInShoppingCartPage()
+        ? getCartSubmitButton()
+        : isTicketSelectionPage()
+          ? getFinalBuyButton()
+          : getEntryButton();
+    if (!btn || isDisabled(btn)) {
+      updateStatus('未找到可点击的页面原生下一步按钮', '#dc3545');
+      return false;
+    }
+    burstClick(btn, 1);
+    updateStatus('已点击页面原生下一步按钮', '#28a745');
+    return true;
+  }
+
+  function extractApiState() {
+    const records = networkRecorder.records.slice(-80);
+    const endpoints = records.map((record) => ({
+      method: record.method,
+      url: record.url,
+      status: record.status,
+      type: record.type
+    }));
+    return {
+      recording: networkRecorder.recording,
+      records: records.length,
+      endpoints
+    };
+  }
+
+  function matchTarget(pageState = extractPageState()) {
+    const target = pageState.target;
+    const targetSession = pageState.sessions.find((item) => item.position === target.sessionPosition) || null;
+    const targetTicket = pageState.tickets.find((item) => item.position === target.pricePosition) || null;
+    const quantityOk = !pageState.quantity.limit || target.quantity <= pageState.quantity.limit;
+    return {
+      matched: !!targetTicket && quantityOk,
+      targetSession,
+      targetTicket,
+      quantityOk,
+      notes: [
+        targetSession ? null : '当前页面未能确认目标场次',
+        targetTicket ? null : '当前页面未能确认目标票档',
+        quantityOk ? null : `目标数量超过页面限购 ${pageState.quantity.limit}`
+      ].filter(Boolean)
+    };
+  }
+
+  function buildPurchaseCandidate() {
+    const candidate = buildPurchaseCandidateDryRun();
+    return {
+      ...candidate,
+      mode: 'dry-run-only',
+      willSendRequest: false,
+      canBuildCreateOrderRequest: false,
+      pageState: extractPageState(),
+      apiState: extractApiState(),
+      matched: candidate.validation
+    };
+  }
+
+  function dryRunPurchase() {
+    const candidate = buildPurchaseCandidate();
+    logDebug('Dry Run：候选购票参数（不会发送创建订单请求）', candidate);
+    try {
+      console.table({
+        page: `${candidate.pageState.page.host}${candidate.pageState.page.path}`,
+        projectId: candidate.event?.projectId || candidate.pageState.ids.projectId || '',
+        showId: candidate.session?.showId || candidate.pageState.ids.selectedShowId || '',
+        ticketId: candidate.ticketTier?.ticketId || candidate.ticketTier?.projectTicketId || candidate.pageState.ids.selectedTicketId || '',
+        targetSession: candidate.session?.name || candidate.pageState.target.sessionPosition,
+        targetTicket: candidate.ticketTier?.ticketName || candidate.ticketTier?.name || candidate.pageState.target.pricePosition,
+        quantity: candidate.pageState.target.quantity,
+        matched: candidate.validation?.valid
+      });
+    } catch (_) {}
+    updateStatus('Dry Run 已输出到控制台；未发送创建订单请求', '#17a2b8');
+    return candidate;
+  }
+
+  function feasibilityReport() {
+    const candidate = buildPurchaseCandidate();
+    const hasCreateLikeRecord = networkRecorder.records.some((record) =>
+      /order|trade|cart|submit|lock|ticket/i.test(record.url) &&
+      String(record.method || '').toUpperCase() === 'POST'
+    );
+    const report = {
+      conclusion: hasCreateLikeRecord
+        ? '发现疑似状态改变请求，请结合导出的日志继续人工核对。'
+        : '当前页面/日志尚未捕获创建订单或锁票接口，暂不建议直接 API 下单。',
+      recommendedMode: hasCreateLikeRecord ? 'API 识别 + 页面点击混合方案' : '先记录真实购票链路，再做 API 识别 + 页面点击混合方案',
+      dryRunCandidate: candidate
+    };
+    logDebug('API 可行性报告（页面内原型）', report);
+    return report;
+  }
+
   function setAutoRunFlag(enabled) {
     try {
       if (enabled) localStorage.setItem(AUTO_RUN_KEY, '1');
@@ -1855,7 +3231,7 @@
   }
 
   function shouldAutoHandleCashierPage() {
-    return isCashierPaymentPage() && (!!readPaymentHandoff() || shouldAutoContinueToCashier());
+    return isCashierPaymentPage();
   }
 
   async function clickCartSubmitOrder(token, {
@@ -1895,6 +3271,482 @@
     throw new Error('提交訂單按钮存在但未能点击');
   }
 
+  function isVerifyRequiredJson(json) {
+    const code = json?.code ?? json?.statusCode ?? json?.errno;
+    const text = `${json?.msg || ''} ${json?.message || ''} ${json?.data?.verifyUrl || ''} ${json?.data?.requestCode || ''}`;
+    return String(code) === '801' || /verifyUrl|requestCode|驗證|验证|captcha/i.test(text);
+  }
+
+  function getApiErrorMessage(label, json) {
+    const code = json?.code ?? json?.statusCode ?? json?.errno ?? '';
+    const msg = json?.msg || json?.message || json?.error || '';
+    if (isVerifyRequiredJson(json)) {
+      const requestCode = json?.data?.requestCode ? ` requestCode=${json.data.requestCode}` : '';
+      return `${label} 需要验证/风控确认（code=${code || 801}${requestCode}）`;
+    }
+    return `${label} 接口失败${code !== '' ? ` code=${code}` : ''}${msg ? ` ${msg}` : ''}`;
+  }
+
+  async function apiFetchJson(path, {
+    method = 'GET',
+    params = {},
+    body = null,
+    base = location.origin,
+    headers = {},
+    allowBusinessError = false
+  } = {}) {
+    const url = new URL(path, base);
+    Object.keys(params || {}).forEach((key) => {
+      if (params[key] != null && params[key] !== '') url.searchParams.set(key, String(params[key]));
+    });
+
+    const requestHeaders = {
+      accept: 'application/json, text/plain, */*',
+      language: 'zh-HK',
+      clientplatform: '1',
+      sellchannel: '23',
+      ...headers
+    };
+    if (body != null && !Object.keys(requestHeaders).some((key) => key.toLowerCase() === 'content-type')) {
+      requestHeaders['content-type'] = 'application/json;charset=UTF-8';
+    }
+    const uuid = getRuntimeUuid();
+    if (uuid && !Object.keys(requestHeaders).some((key) => key.toLowerCase() === 'uuid')) {
+      requestHeaders.uuid = uuid;
+    }
+
+    const response = await pageWindow.fetch(url.toString(), {
+      method,
+      credentials: 'include',
+      headers: requestHeaders,
+      body: body == null ? undefined : JSON.stringify(body)
+    });
+    const text = await response.text();
+    const json = safeJsonParse(text);
+    captureApiSnapshot({ url: url.toString(), responseBody: text });
+    if (!response.ok) throw new Error(`${getUrlPath(url.toString())} HTTP ${response.status}`);
+    if (!json) throw new Error(`${getUrlPath(url.toString())} 未返回 JSON`);
+    const code = json.code ?? json.statusCode ?? json.errno;
+    const ok = json.success === true || code === 200 || code === 0 || code == null;
+    if (allowBusinessError) return json;
+    if (!ok) throw new Error(getApiErrorMessage(getUrlPath(url.toString()), json));
+    return json;
+  }
+
+  function getRuntimeUuid() {
+    const keys = ['uuid', 'iuuid', 'UTIX_UUID', 'uutix_uuid', 'myshow_uuid'];
+    for (const store of [localStorage, sessionStorage]) {
+      for (const key of keys) {
+        try {
+          const v = store.getItem(key);
+          if (isUsableRiskValue(v, 16) && /^[A-Za-z0-9_-]{16,}$/.test(v)) return v;
+        } catch (_) {}
+      }
+    }
+    try {
+      const cookieHit = String(document.cookie || '').split(';')
+        .map((item) => item.trim().split('='))
+        .find(([key]) => /^(uuid|iuuid)$/i.test(key || ''));
+      if (cookieHit?.[1]) return decodeURIComponent(cookieHit[1]);
+    } catch (_) {}
+    for (const record of networkRecorder.records.slice().reverse()) {
+      const headers = record?.requestHeaders || {};
+      for (const key of Object.keys(headers)) {
+        if (/^uuid$/i.test(key) && isUsableRiskValue(headers[key], 16) && /^[A-Za-z0-9_-]{16,}$/.test(String(headers[key] || ''))) return String(headers[key]);
+      }
+    }
+    return '';
+  }
+
+  function isUsableRiskValue(value, minLength = 20) {
+    const text = String(value || '');
+    return text.length >= minLength && !/[<>]/.test(text) && !/redacted|undefined|null/i.test(text);
+  }
+
+  function getRuntimeFingerprint() {
+    const probes = [
+      () => pageWindow?.rohrdata,
+      () => pageWindow?.__rohr_fingerprint,
+      () => pageWindow?.Rohr_Opt?.reload?.(),
+      () => pageWindow?.Rohr?.reload?.(),
+      () => pageWindow?.Rohr_Opt?.getToken?.(),
+      () => pageWindow?.Rohr?.getToken?.()
+    ];
+    for (const probe of probes) {
+      try {
+        const value = probe();
+        if (value && typeof value === 'string' && isUsableRiskValue(value, 20)) return value;
+      } catch (_) {}
+    }
+    const risk = findCapturedRiskRequest();
+    return isUsableRiskValue(risk?.fingerprint, 20) ? String(risk.fingerprint) : '';
+  }
+
+  function findCapturedRiskRequest(payment = false) {
+    const key = payment ? 'riskParam' : null;
+    for (const record of networkRecorder.records.slice().reverse()) {
+      const body = typeof record?.requestBody === 'string'
+        ? safeJsonParse(record.requestBody)
+        : record?.requestBody;
+      if (!body || typeof body !== 'object') continue;
+      if (key && body[key]) return body[key];
+      if (!payment && body.cartRiskRequest) return body.cartRiskRequest;
+      if (!payment && body.orderRiskRequest) return body.orderRiskRequest;
+      if (body.riskParam) return body.riskParam;
+    }
+    return null;
+  }
+
+  function makeRiskRequest(payment = false) {
+    const captured = findCapturedRiskRequest(payment) || {};
+    const capturedUuid = isUsableRiskValue(captured.uuid, 16) ? String(captured.uuid) : '';
+    const capturedFingerprint = isUsableRiskValue(captured.fingerprint, 20) ? String(captured.fingerprint) : '';
+    const uuid = capturedUuid || getRuntimeUuid();
+    const fingerprint = capturedFingerprint || getRuntimeFingerprint();
+    if (payment) {
+      return {
+        ...(fingerprint ? { fingerprint } : {}),
+        location: JSON.stringify({ longitude: '', latitude: '' }),
+        os: 3,
+        platform: 0,
+        userAgent: navigator.userAgent,
+        rcVersion: { os: 'Windows 10', app: '1', my: '1' }
+      };
+    }
+    return {
+      ...(uuid ? { uuid } : {}),
+      ...(fingerprint ? { fingerprint } : {}),
+      version: '1',
+      os: 3,
+      platform: 4,
+      userAgent: navigator.userAgent
+    };
+  }
+
+  async function getUserInfoFast() {
+    try {
+      const json = await apiFetchJson('/api/account/uutix/getUserInfo', {
+        params: { t: Date.now(), WuKongReady: 'h5' }
+      });
+      return json.data || {};
+    } catch (e) {
+      logDebug('getUserInfo 失败，使用页面/空值继续', e?.message || String(e));
+      return {};
+    }
+  }
+
+  function selectByPositionOrInventory(items, position) {
+    const pos = Math.max(1, parseInt(position, 10) || 1);
+    return items[pos - 1] || items.find((item) => item.hasInventory !== false) || items[0] || null;
+  }
+
+  async function loadApiSessionAndTicketForFastPath(target, token) {
+    await ensureNotStopped(token);
+    const projectId = getUrlParamValue(['pId', 'projectId']) || extractPageState().ids.projectId;
+    if (!projectId) throw new Error('API快路径缺少 pId/projectId');
+
+    const showJson = await apiFetchJson('/api/oversea/show/list', {
+      params: { t: Date.now(), projectId, WuKongReady: 'h5' }
+    });
+    const shows = Array.isArray(showJson.data) ? showJson.data.map(normalizeApiShow) : [];
+    if (!shows.length) throw new Error('API快路径未获取到场次列表');
+    const session = selectByPositionOrInventory(shows, target.sessionPosition);
+    if (!session?.showId) throw new Error('API快路径无法确定 showId');
+
+    const ticketJson = await apiFetchJson('/api/oversea/ticket/list', {
+      params: { t: Date.now(), showId: session.showId, WuKongReady: 'h5' }
+    });
+    const tickets = Array.isArray(ticketJson.data) ? ticketJson.data.map(normalizeApiTicket) : [];
+    if (!tickets.length) throw new Error('API快路径未获取到票档列表');
+    const ticket = selectByPositionOrInventory(tickets, target.pricePosition);
+    if (!ticket?.ticketId) throw new Error('API快路径无法确定 ticketId');
+
+    const check = validateQuantity(ticket, target.quantity);
+    if (!check.valid) throw new Error(`API快路径目标不可购：${check.reason.join('；')}`);
+
+    return {
+      projectId: String(ticket.projectId || session.projectId || projectId),
+      session,
+      ticket
+    };
+  }
+
+  function buildOrderBodyFromCartDetail(detailJson, userInfo = {}) {
+    const data = detailJson?.data || {};
+    const extend = { ...(data.shoppingCartExtendInfo || {}) };
+    const email = extend.email || userInfo.email || userInfo.loginEmail || userInfo.account || '';
+    const phone = extend.phone || userInfo.mobile || userInfo.phone || '';
+    extend.email = email;
+    extend.phoneAreaCode = extend.phoneAreaCode || userInfo.phoneAreaCode || userInfo.areaCode || '86';
+    extend.phone = phone;
+    extend.fetchType = extend.fetchType || 1;
+    if (!('ticketRealNameInfos' in extend)) extend.ticketRealNameInfos = null;
+    extend.deliveryModelInfo = extend.deliveryModelInfo || {
+      recipientName: '',
+      recipientMobileAreaCode: '',
+      recipientMobileNo: '',
+      cityId: 0,
+      cityName: '',
+      districtId: 0,
+      districtName: '',
+      areaId: 0,
+      areaName: '',
+      detailedAddress: ''
+    };
+
+    const baseInfo = { ...(data.shoppingCartBaseInfo || {}) };
+    if (!('shipmentFeePayType' in baseInfo)) baseInfo.shipmentFeePayType = 0;
+
+    return {
+      showInfoList: data.showInfoList || [],
+      shoppingCartExtendInfo: extend,
+      shoppingCartBaseInfo: baseInfo,
+      orderRiskRequest: makeRiskRequest(false)
+    };
+  }
+
+  function extractCartIdFromAddToCart(addJson) {
+    const data = addJson?.data || {};
+    return data.shoppingCartData?.cartId ||
+      data.pendingPaymentInfo?.shoppingCartId ||
+      data.projectGroupCheck?.cartId ||
+      data.shoppingCartNo ||
+      null;
+  }
+
+  function extractOrderIdFromPending(addJson) {
+    const data = addJson?.data || {};
+    return data.pendingPaymentInfo?.orderId ||
+      data.orderCheck?.orderId ||
+      data.orderId ||
+      null;
+  }
+
+  function isPendingCartResponse(json) {
+    const data = json?.data || {};
+    return !!(
+      data.pendingPaymentInfo?.shoppingCartId ||
+      data.projectGroupCheck?.cartId ||
+      data.shoppingCartNo ||
+      data.pendingPaymentInfo?.orderId ||
+      data.orderCheck?.orderId
+    );
+  }
+
+  async function cancelShoppingCart(cartId, reason = '') {
+    if (!cartId) return false;
+    const json = await apiFetchJson('/api/oversea/shoppingCart/cancel', {
+      params: { t: Date.now(), WuKongReady: 'h5', shoppingCartNo: cartId },
+      allowBusinessError: true
+    });
+    const code = json?.code ?? json?.statusCode ?? json?.errno;
+    const ok = json?.success === true || json?.data === true || code === 200 || code === 0 || code == null;
+    if (!ok) throw new Error(getApiErrorMessage('/api/oversea/shoppingCart/cancel', json));
+    logDebug('已取消待支付购物车', { cartId, reason });
+    return true;
+  }
+
+  async function getReusablePendingPay(projectId, { cancelForeign = false } = {}) {
+    try {
+      const json = await apiFetchJson('/api/oversea/shoppingCart/pendingPay', {
+        params: { t: Date.now(), WuKongReady: 'h5' }
+      });
+      const data = json?.data || {};
+      const ids = Array.isArray(data.projectIds) ? data.projectIds.map((id) => String(id)) : [];
+      const sameProject = !ids.length || ids.includes(String(projectId));
+
+      const orderId = data.orderId || null;
+      const cartId = data.shoppingCartNo || null;
+      const orderLeft = Number(data.orderLeftTime || 0);
+      const cartLeft = Number(data.shoppingCartLeftTime || 0);
+      if (!sameProject) {
+        if (cancelForeign && cartId && (!Number.isFinite(cartLeft) || cartLeft >= 0)) {
+          updateStatus(`API快路径：取消其他项目待支付购物车(${ids.join(',') || 'unknown'})...`, '#ff9800');
+          await cancelShoppingCart(cartId, `foreign project: ${ids.join(',') || 'unknown'} != ${projectId}`);
+        }
+        return null;
+      }
+      if (orderId && (!Number.isFinite(orderLeft) || orderLeft >= 0)) {
+        return { orderId, cartId, source: 'pendingPay-order' };
+      }
+      if (cartId && (!Number.isFinite(cartLeft) || cartLeft >= 0)) {
+        return { cartId, orderId: null, source: 'pendingPay-cart' };
+      }
+      return null;
+    } catch (e) {
+      logDebug('pendingPay 查询失败，继续正常加购', e?.message || String(e));
+      return null;
+    }
+  }
+
+  function buildCashierUrl({ tradeNo, payToken, orderId, projectId, remainPayExpireTime }) {
+    const statusQuery = `orderId=${orderId},remainPayExpireTime=${remainPayExpireTime || ''},creatPayTime=${Date.now()}`;
+    const statusUrl = new URL('/payment-status', 'https://www.uutix.com');
+    statusUrl.searchParams.set('paymentStatusQuery', statusQuery);
+    const url = new URL('/oversea/cashier', 'https://mcashier.uutix.com');
+    url.searchParams.set('tradeNo', tradeNo);
+    url.searchParams.set('payToken', payToken);
+    url.searchParams.set('channelId', '190001');
+    url.searchParams.set('orderId', orderId);
+    url.searchParams.set('pageSource', 'confirm');
+    url.searchParams.set('successUrl', statusUrl.toString());
+    url.searchParams.set('backUrl', statusUrl.toString());
+    url.searchParams.set('language', 'zh-HK');
+    url.searchParams.set('projectId', projectId);
+    return url.toString();
+  }
+
+  async function executeApiFastPurchaseSequence(token) {
+    const originalUrl = location.href;
+    try {
+      await ensureNotStopped(token);
+      const target = readTargetsFromPanel();
+      updateStatus('API快路径：读取场次/票档...', '#17a2b8');
+      const { projectId, session, ticket } = await loadApiSessionAndTicketForFastPath(target, token);
+      let effectiveProjectId = projectId;
+
+      const reusable = await getReusablePendingPay(projectId, { cancelForeign: true });
+      let cartId = reusable?.cartId || null;
+      let orderId = reusable?.orderId || null;
+
+      if (cartId || orderId) {
+        updateStatus(orderId ? 'API快路径：发现已有待支付订单，直接复用...' : 'API快路径：发现已有待支付购物车，直接复用...', '#ff9800');
+      } else {
+        const postAddToCart = () => apiFetchJson('/api/oversea/shopping/addToCart', {
+          method: 'POST',
+          params: { t: Date.now(), mySigPid: projectId, WuKongReady: 'h5' },
+          allowBusinessError: true,
+          body: {
+            shoppingCartParams: [{
+              projectGroupId: '',
+              projectId,
+              showId: Number(session.showId),
+              ticketId: Number(ticket.ticketId || ticket.projectTicketId),
+              quantity: target.quantity,
+              needSeat: false
+            }],
+            cartRiskRequest: makeRiskRequest(false)
+          }
+        });
+
+        updateStatus(`API快路径：加购 ${session.position}/${ticket.position} x${target.quantity}...`, '#007bff');
+        let addJson = await postAddToCart();
+        const addCode = addJson?.code ?? addJson?.statusCode ?? addJson?.errno;
+        let addOk = addJson?.success === true || addCode === 200 || addCode === 0 || addCode == null;
+        if (!addOk && isPendingCartResponse(addJson)) {
+          const pendingAfterAdd = await getReusablePendingPay(projectId, { cancelForeign: true });
+          if (!pendingAfterAdd) {
+            updateStatus('API快路径：已处理旧购物车，重试加购...', '#17a2b8');
+            addJson = await postAddToCart();
+            const retryCode = addJson?.code ?? addJson?.statusCode ?? addJson?.errno;
+            addOk = addJson?.success === true || retryCode === 200 || retryCode === 0 || retryCode == null;
+          } else {
+            cartId = pendingAfterAdd.cartId || null;
+            orderId = pendingAfterAdd.orderId || null;
+            addOk = true;
+          }
+        }
+        if (!addOk && !isPendingCartResponse(addJson)) {
+          throw new Error(getApiErrorMessage('/api/oversea/shopping/addToCart', addJson));
+        }
+
+        orderId = orderId || extractOrderIdFromPending(addJson);
+        cartId = cartId || extractCartIdFromAddToCart(addJson);
+        if (!cartId && !orderId) throw new Error('API快路径 addToCart 未返回 cartId/orderId');
+        if (!addOk) {
+          updateStatus(orderId ? 'API快路径：发现已有待支付订单，复用 orderId...' : 'API快路径：发现已有待支付购物车，复用 cartId...', '#ff9800');
+        }
+      }
+
+      try {
+        if (cartId) history.replaceState(history.state, document.title, `/shopping-cart?shoppingCartId=${encodeURIComponent(cartId)}&pId=${encodeURIComponent(effectiveProjectId)}`);
+      } catch (_) {}
+
+      if (!orderId) {
+        updateStatus('API快路径：读取购物车明细...', '#007bff');
+        const detailJson = await apiFetchJson('/api/oversea/shoppingCart/detail', {
+          params: { t: Date.now(), WuKongReady: 'h5' }
+        });
+        const detailProjectId = detailJson?.data?.showInfoList?.find((item) => item?.projectId)?.projectId;
+        if (detailProjectId != null && detailProjectId !== '') effectiveProjectId = String(detailProjectId);
+        const userInfo = await getUserInfoFast();
+
+        try {
+          history.replaceState(history.state, document.title, `/trade-confirmation?shoppingCartId=${encodeURIComponent(cartId)}&pId=${encodeURIComponent(effectiveProjectId)}`);
+        } catch (_) {}
+
+        updateStatus('API快路径：创建订单...', '#007bff');
+        const createJson = await apiFetchJson('/api/oversea/order/createV3', {
+          method: 'POST',
+          params: { t: Date.now(), mySigPid: effectiveProjectId, WuKongReady: 'h5' },
+          allowBusinessError: true,
+          body: buildOrderBodyFromCartDetail(detailJson, userInfo)
+        });
+        const createCode = createJson?.code ?? createJson?.statusCode ?? createJson?.errno;
+        const createOk = createJson?.success === true || createCode === 200 || createCode === 0 || createCode == null;
+        if (!createOk) {
+          if (String(createCode) === '240025004' && cartId) {
+            setCartSubmitFlag(true);
+            setPayNowFlag(false);
+            updateStatus('API建单返回购票人数过多：转购物车由页面继续提交...', '#ff9800');
+            location.href = `/shopping-cart?shoppingCartId=${encodeURIComponent(cartId)}&pId=${encodeURIComponent(effectiveProjectId)}`;
+            return true;
+          }
+          throw new Error(getApiErrorMessage('/api/oversea/order/createV3', createJson));
+        }
+        orderId = createJson?.data?.orderId;
+        if (!orderId) throw new Error('API快路径 order/createV3 未返回 orderId');
+      }
+
+      updateStatus('API快路径：获取支付 token...', '#007bff');
+      const tokenJson = await apiFetchJson('/api/oversea/pay/token', {
+        method: 'POST',
+        params: { t: Date.now(), orderId, WuKongReady: 'h5' },
+        body: { orderRiskRequest: {} }
+      });
+      const payData = tokenJson?.data || {};
+      if (!payData.tradeNo || !payData.payToken) throw new Error('API快路径 pay/token 未返回 tradeNo/payToken');
+
+      const method = normalizePaymentMethod(target.paymentMethod);
+      setStoredPaymentMethod(method);
+      writePaymentHandoff(getPaymentSettingsForHandoff());
+      setCashierAutoFlag(true);
+      setCartSubmitFlag(false);
+      setPayNowFlag(false);
+      clearCrowdRetryFlag();
+
+      const cashierUrl = buildCashierUrl({
+        tradeNo: payData.tradeNo,
+        payToken: payData.payToken,
+        orderId,
+        projectId: effectiveProjectId,
+        remainPayExpireTime: payData.remainPayExpireTime
+      });
+      updateStatus('API快路径完成：跳转收银台...', '#28a745');
+      location.href = cashierUrl;
+      return true;
+    } catch (e) {
+      try {
+        if (location.origin === new URL(originalUrl).origin) history.replaceState(history.state, document.title, originalUrl);
+      } catch (_) {}
+      throw e;
+    }
+  }
+
+  async function executeHybridPurchaseSequence(token) {
+    if (!loadTargetConfig().apiFastPath) {
+      return executePurchaseSequence(token);
+    }
+    try {
+      return await executeApiFastPurchaseSequence(token);
+    } catch (e) {
+      logDebug('API快路径失败，回退 v18 DOM 流程', e?.message || String(e));
+      updateStatus(`API快路径失败，回退页面流程：${e?.message || e}`, '#ff9800');
+      await sleep(250);
+      return executePurchaseSequence(token);
+    }
+  }
+
   async function executePurchaseSequence(token) {
     try {
       setAutoRunFlag(false);
@@ -1911,7 +3763,7 @@
 
       if (target.sessionPosition !== 1 && isLoadingVisible()) {
         updateStatus('开始前：等待 loading 稳定结束...', '#ffc107');
-        await waitLoadingStableGone(token, { stableGoneMs: 280 });
+        await waitLoadingStableGone(token, { stableGoneMs: 140 });
       }
 
       const s = await stepSelectSession(target.sessionPosition, token);
@@ -2125,14 +3977,14 @@
         }
 
         if (startedOnTicketPage) {
-          updateStatus('已在购票流程页：直接执行选择流程...', '#17a2b8');
-          await executePurchaseSequence(token);
+          updateStatus(loadTargetConfig().apiFastPath ? '已在购票流程页：优先执行 API 快路径...' : '已在购票流程页：直接执行选择流程...', '#17a2b8');
+          await executeHybridPurchaseSequence(token);
           return;
         }
 
         updateStatus('等待入口按钮变为购买状态...', '#17a2b8');
         await waitEntryBecomeBuyAndClick(token);
-        await executePurchaseSequence(token);
+        await executeHybridPurchaseSequence(token);
       } catch (e) {
         if (String(e?.message || '') === '已停止') updateStatus('已停止', '#6c757d');
         else updateStatus(`出错: ${e.message || e}`, '#dc3545');
@@ -2282,6 +4134,58 @@
     if (shouldSave) saveTargetsToStorage(readTargetsFromPanel());
   }
 
+  function scheduleAutoStart(status, color, readyFn, {
+    delayMs = 0,
+    fallbackMs = AUTO_START_FALLBACK_MS
+  } = {}) {
+    updateStatus(status, color);
+
+    let started = false;
+    let observer = null;
+    let fallbackTimer = null;
+
+    const cleanup = () => {
+      if (observer) {
+        try { observer.disconnect(); } catch (_) {}
+        observer = null;
+      }
+      if (fallbackTimer) {
+        clearTimeout(fallbackTimer);
+        fallbackTimer = null;
+      }
+    };
+
+    const start = () => {
+      if (started || isRunning) return;
+      started = true;
+      cleanup();
+      setTimeout(() => {
+        if (!isRunning) startMonitoring();
+      }, delayMs);
+    };
+
+    const tryStart = () => {
+      if (started || isRunning) return true;
+      let ready = false;
+      try { ready = !readyFn || !!readyFn(); } catch (_) { ready = false; }
+      if (ready) start();
+      return ready;
+    };
+
+    if (tryStart()) return;
+
+    try {
+      observer = new MutationObserver(() => { tryStart(); });
+      observer.observe(document.documentElement || document.body, {
+        subtree: true,
+        childList: true,
+        attributes: true
+      });
+    } catch (_) {}
+
+    fallbackTimer = setTimeout(start, fallbackMs);
+  }
+
   function createControlPanel() {
     if (document.getElementById('uutix-helper-panel')) return;
     if (!document.body) return;
@@ -2290,7 +4194,7 @@
     panel.id = 'uutix-helper-panel';
     panel.innerHTML = `
       <div id="uutix-helper-header">
-        <div id="uutix-helper-title">UUTIX v17</div>
+        <div id="uutix-helper-title">UUTIX v19</div>
         <button id="uutix-helper-hide" type="button">隐藏</button>
       </div>
 
@@ -2331,6 +4235,10 @@
         </select>
       </div>
 
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px; font-size:12px;">
+        <label><input type="checkbox" id="api-fast-path-enabled" checked> API快路径</label>
+      </div>
+
       <div id="uutix-card-fields">
         <div class="uutix-row">
           <span>持卡人:</span>
@@ -2368,7 +4276,12 @@
 
     applySavedPanelPosition(panel);
     loadTargetsIntoPanel();
+    restoreTargetConfig();
     toggleCardFields();
+    updateProbeStatusArea();
+    if (document.getElementById('request-record-enabled')?.checked) {
+      startNetworkRecording();
+    }
 
     document.getElementById('start-btn').onclick = startMonitoring;
     document.getElementById('stop-btn').onclick = () => stopMonitoring(false);
@@ -2386,6 +4299,19 @@
       toggleCardFields();
       saveTargetsToStorage(readTargetsFromPanel());
     };
+    [
+      'api-fast-path-enabled'
+    ].forEach((id) => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      const handler = () => {
+        saveTargetConfig();
+        updateProbeStatusArea();
+        if (id === 'request-record-enabled' && el.checked && !networkRecorder.recording) startNetworkRecording();
+      };
+      el.addEventListener('change', handler);
+      el.addEventListener('input', handler);
+    });
     dock.onclick = () => setPanelHidden(panel, dock, false);
 
     setupPanelDrag(panel, document.getElementById('uutix-helper-header'));
@@ -2396,30 +4322,36 @@
     setPanelHidden(panel, dock, isHidden, false);
 
     if (shouldAutoHandleCrowdPage()) {
-      updateStatus('检测到购票拥挤页：冷却后自动刷新...', '#ff9800');
-      setTimeout(() => {
-        if (!isRunning) startMonitoring();
-      }, 500);
+      scheduleAutoStart(
+        '检测到购票拥挤页：冷却后自动刷新...',
+        '#ff9800',
+        () => isCrowdLimitPage()
+      );
     } else if (shouldAutoHandleCashierPage()) {
-      updateStatus('检测到支付页：自动选择支付方式并确认...', '#17a2b8');
-      setTimeout(() => {
-        if (!isRunning) startMonitoring();
-      }, 150);
+      scheduleAutoStart(
+        '检测到支付页：自动选择支付方式并确认...',
+        '#17a2b8',
+        () => getCashierPaymentItems().length > 0 || !!getCashierConfirmButton(),
+        { delayMs: CASHIER_AUTO_START_DELAY_MS }
+      );
     } else if (shouldAutoPayOnPreviewPage()) {
-      updateStatus('检测到交易預覽页：自动勾选并点击立即支付...', '#17a2b8');
-      setTimeout(() => {
-        if (!isRunning) startMonitoring();
-      }, 120);
+      scheduleAutoStart(
+        '检测到交易預覽页：自动勾选并点击立即支付...',
+        '#17a2b8',
+        () => isTradePreviewPage()
+      );
     } else if (shouldAutoSubmitOnCartPage()) {
-      updateStatus('检测到購物車页：自动提交訂單...', '#17a2b8');
-      setTimeout(() => {
-        if (!isRunning) startMonitoring();
-      }, 180);
+      scheduleAutoStart(
+        '检测到購物車页：自动提交訂單...',
+        '#17a2b8',
+        () => isInShoppingCartPage()
+      );
     } else if (shouldAutoRunOnTicketPage()) {
-      updateStatus('检测到详情页跳转：自动继续购票流程...', '#17a2b8');
-      setTimeout(() => {
-        if (!isRunning) startMonitoring();
-      }, 250);
+      scheduleAutoStart(
+        '检测到详情页跳转：自动继续购票流程...',
+        '#17a2b8',
+        () => isTicketSelectionPage()
+      );
     }
   }
 

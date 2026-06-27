@@ -64,6 +64,16 @@
   const CROWD_RETRY_MAX_ATTEMPTS = 8;
   const CROWD_RETRY_BASE_COOLDOWN_MS = 4200;
   const CROWD_RETRY_JITTER_MS = 1600;
+  const networkRecorder = {
+    installed: false,
+    recording: false,
+    records: [],
+    maxRecords: 800,
+    originalFetch: null,
+    originalXhrOpen: null,
+    originalXhrSetRequestHeader: null,
+    originalXhrSend: null
+  };
 
   const addStyle = (typeof GM_addStyle === 'function')
     ? GM_addStyle
@@ -225,6 +235,268 @@
       s.textContent = `状态: ${msg}`;
       s.style.color = color;
     }
+  }
+
+  function safeJsonParse(text) {
+    try { return JSON.parse(text); } catch (_) { return null; }
+  }
+
+  function redactSensitiveText(value) {
+    if (value == null) return value;
+    let text = String(value);
+    text = text.replace(/(authorization|cookie|set-cookie|payToken|paytoken|token|sign|mygsig|m-traceid|nonce|fingerprint|uuid|iuuid|cardNo|cardNumber|pan|cvv|cvc)["']?\s*[:=]\s*["']?([^"',&\s}]+)/gi, '$1:<redacted>');
+    text = text.replace(/([?&](?:payToken|paytoken|token|tradeNo|tradeno|orderId|orderid|sign|mygsig|m-traceid|nonce|s|uuid|iuuid)=)[^&#]+/gi, '$1<redacted>');
+    text = text.replace(/\b[A-Fa-f0-9]{24,}\b/g, '<hex-redacted>');
+    text = text.replace(/\b\d{12,19}\b/g, '<number-redacted>');
+    return text;
+  }
+
+  function redactUrl(url) {
+    try {
+      const u = new URL(String(url), location.href);
+      ['payToken', 'paytoken', 'token', 'tradeNo', 'tradeno', 'orderId', 'orderid', 'sign', 'nonce', 's', 'uuid'].forEach((key) => {
+        if (u.searchParams.has(key)) u.searchParams.set(key, '<redacted>');
+      });
+      return u.toString();
+    } catch (_) {
+      return redactSensitiveText(url);
+    }
+  }
+
+  function isUutixRelatedUrl(url) {
+    try {
+      const u = new URL(String(url), location.href);
+      return /uutix\.com|wxmovie\.com|wepayez\.com/i.test(u.hostname);
+    } catch (_) {
+      return /uutix|wxmovie|wepayez/i.test(String(url || ''));
+    }
+  }
+
+  function summarizeBody(body) {
+    if (body == null) return null;
+    if (typeof body === 'string') {
+      const trimmed = body.length > 3000 ? `${body.slice(0, 3000)}...<truncated>` : body;
+      const parsed = safeJsonParse(trimmed);
+      return parsed ? redactSensitiveObject(parsed) : redactSensitiveText(trimmed);
+    }
+    if (body instanceof URLSearchParams) return redactSensitiveText(body.toString());
+    if (body instanceof FormData) {
+      const out = {};
+      try {
+        body.forEach((value, key) => {
+          out[key] = value instanceof File ? `[File:${value.name || 'blob'}]` : redactSensitiveText(value);
+        });
+      } catch (_) {}
+      return out;
+    }
+    if (body instanceof Blob) return `[Blob:${body.type || 'unknown'},${body.size || 0}]`;
+    if (body instanceof ArrayBuffer) return `[ArrayBuffer:${body.byteLength}]`;
+    try { return redactSensitiveObject(body); } catch (_) { return `[${Object.prototype.toString.call(body)}]`; }
+  }
+
+  function summarizeHeaders(headers) {
+    if (!headers) return null;
+    const out = {};
+    try {
+      if (headers instanceof Headers) {
+        headers.forEach((value, key) => { out[key] = redactSensitiveText(value); });
+        return out;
+      }
+      if (Array.isArray(headers)) {
+        headers.forEach((pair) => {
+          if (Array.isArray(pair) && pair.length >= 2) out[pair[0]] = redactSensitiveText(pair[1]);
+        });
+        return out;
+      }
+      Object.keys(headers).forEach((key) => {
+        out[key] = redactSensitiveText(headers[key]);
+      });
+      return out;
+    } catch (_) {
+      return '[unreadable-headers]';
+    }
+  }
+
+  function redactSensitiveObject(input, depth = 0) {
+    if (input == null) return input;
+    if (depth > 5) return '[depth-limit]';
+    if (typeof input !== 'object') return redactSensitiveText(input);
+    if (Array.isArray(input)) return input.slice(0, 80).map((item) => redactSensitiveObject(item, depth + 1));
+    const out = {};
+    Object.keys(input).slice(0, 120).forEach((key) => {
+      const lower = key.toLowerCase();
+      if (/authorization|cookie|token|sign|mygsig|m-traceid|nonce|fingerprint|uuid|iuuid|card|cvv|cvc|pan/.test(lower)) {
+        out[key] = '<redacted>';
+      } else {
+        out[key] = redactSensitiveObject(input[key], depth + 1);
+      }
+    });
+    return out;
+  }
+
+  function recordNetworkEntry(entry) {
+    if (!networkRecorder.recording || !isUutixRelatedUrl(entry.url)) return;
+    const safeEntry = {
+      ts: new Date().toISOString(),
+      type: entry.type || 'request',
+      method: entry.method || 'GET',
+      url: redactUrl(entry.url),
+      status: entry.status ?? null,
+      durationMs: entry.durationMs ?? null,
+      requestHeaders: summarizeHeaders(entry.requestHeaders),
+      requestBody: summarizeBody(entry.requestBody),
+      responseBody: summarizeBody(entry.responseBody)
+    };
+    networkRecorder.records.push(safeEntry);
+    if (networkRecorder.records.length > networkRecorder.maxRecords) {
+      networkRecorder.records.splice(0, networkRecorder.records.length - networkRecorder.maxRecords);
+    }
+    logDebug(`记录请求 ${safeEntry.method} ${safeEntry.url}`, { status: safeEntry.status });
+  }
+
+  function installNetworkInterceptor() {
+    if (networkRecorder.installed) return;
+    networkRecorder.installed = true;
+
+    if (typeof window.fetch === 'function') {
+      networkRecorder.originalFetch = window.fetch.bind(window);
+      window.fetch = async function uutixFetchWrapper(input, init = {}) {
+        const started = Date.now();
+        const url = typeof input === 'string' ? input : input?.url;
+        const method = String(init?.method || input?.method || 'GET').toUpperCase();
+        const requestBody = init?.body;
+        const requestHeaders = init?.headers || input?.headers;
+        try {
+          const response = await networkRecorder.originalFetch(input, init);
+          if (networkRecorder.recording && isUutixRelatedUrl(url)) {
+            const cloned = response.clone();
+            cloned.text().then((text) => {
+              recordNetworkEntry({
+                type: 'fetch',
+                method,
+                url,
+                status: response.status,
+                durationMs: Date.now() - started,
+                requestHeaders,
+                requestBody,
+                responseBody: text
+              });
+            }).catch(() => {
+              recordNetworkEntry({
+                type: 'fetch',
+                method,
+                url,
+                status: response.status,
+                durationMs: Date.now() - started,
+                requestHeaders,
+                requestBody,
+                responseBody: '[unreadable]'
+              });
+            });
+          }
+          return response;
+        } catch (e) {
+          recordNetworkEntry({
+            type: 'fetch',
+            method,
+            url,
+            status: 'ERROR',
+            durationMs: Date.now() - started,
+            requestHeaders,
+            requestBody,
+            responseBody: e?.message || String(e)
+          });
+          throw e;
+        }
+      };
+    }
+
+    if (window.XMLHttpRequest?.prototype) {
+      networkRecorder.originalXhrOpen = XMLHttpRequest.prototype.open;
+      networkRecorder.originalXhrSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
+      networkRecorder.originalXhrSend = XMLHttpRequest.prototype.send;
+      XMLHttpRequest.prototype.open = function uutixXhrOpen(method, url) {
+        this.__uutixRecorderMeta = {
+          method: String(method || 'GET').toUpperCase(),
+          url: String(url || ''),
+          headers: {}
+        };
+        return networkRecorder.originalXhrOpen.apply(this, arguments);
+      };
+      XMLHttpRequest.prototype.setRequestHeader = function uutixXhrSetRequestHeader(name, value) {
+        try {
+          if (!this.__uutixRecorderMeta) this.__uutixRecorderMeta = { headers: {} };
+          this.__uutixRecorderMeta.headers[String(name || '')] = String(value || '');
+        } catch (_) {}
+        return networkRecorder.originalXhrSetRequestHeader.apply(this, arguments);
+      };
+      XMLHttpRequest.prototype.send = function uutixXhrSend(body) {
+        const meta = this.__uutixRecorderMeta || {};
+        const started = Date.now();
+        const xhr = this;
+        try {
+          xhr.addEventListener('loadend', () => {
+            if (!networkRecorder.recording || !isUutixRelatedUrl(meta.url)) return;
+            let responseBody = '[unreadable]';
+            try {
+              if (!xhr.responseType || xhr.responseType === 'text' || xhr.responseType === 'json') {
+                responseBody = xhr.responseText || xhr.response;
+              } else {
+                responseBody = `[${xhr.responseType}]`;
+              }
+            } catch (_) {}
+            recordNetworkEntry({
+              type: 'xhr',
+              method: meta.method,
+              url: meta.url,
+              status: xhr.status,
+              durationMs: Date.now() - started,
+              requestHeaders: meta.headers,
+              requestBody: body,
+              responseBody
+            });
+          });
+        } catch (_) {}
+        return networkRecorder.originalXhrSend.apply(this, arguments);
+      };
+    }
+  }
+
+  function interceptNetworkRequests() {
+    installNetworkInterceptor();
+    return networkRecorder;
+  }
+
+  function startNetworkRecording() {
+    interceptNetworkRequests();
+    networkRecorder.records = [];
+    networkRecorder.recording = true;
+    updateStatus('已开始记录 UUTIX 相关请求（仅监听，不发送请求）', '#17a2b8');
+  }
+
+  function stopNetworkRecording() {
+    networkRecorder.recording = false;
+    updateStatus(`已停止记录，共 ${networkRecorder.records.length} 条`, '#6c757d');
+  }
+
+  function exportNetworkRecords() {
+    const payload = {
+      exportedAt: new Date().toISOString(),
+      page: redactUrl(location.href),
+      count: networkRecorder.records.length,
+      records: networkRecorder.records
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `uutix-network-redacted-${Date.now()}.json`;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => {
+      URL.revokeObjectURL(a.href);
+      a.remove();
+    }, 1000);
+    updateStatus(`已导出脱敏请求日志：${networkRecorder.records.length} 条`, '#28a745');
   }
 
   function isDisabled(el) {
@@ -1838,6 +2110,179 @@
     return panelSettings;
   }
 
+  function getUrlParamValue(names) {
+    const params = new URLSearchParams(location.search || '');
+    for (const name of names) {
+      const value = params.get(name);
+      if (value) return value;
+    }
+    return null;
+  }
+
+  function extractTicketWrapState(wrap, index) {
+    if (!wrap) return null;
+    const item = wrap.querySelector('.item') || wrap;
+    return {
+      position: index + 1,
+      ticketId: parseTicketIdFromWrap(wrap),
+      name: getText(wrap.querySelector('.first-floor, [class*="first-floor"]') || wrap),
+      detail: getText(wrap.querySelector('.second-floor, [class*="second-floor"]') || wrap),
+      stateText: getTicketStateText(wrap),
+      unavailable: isTicketUnavailable(wrap),
+      temporaryNoTicket: isTicketTemporaryNoTicket(wrap),
+      selected: item?.classList?.contains('selected') || wrap.contains(getSelectedTicketWrap())
+    };
+  }
+
+  function extractPageState() {
+    const sessionItems = getSessionItems(getSessionContainerVisible() || getSessionDropdown())
+      .filter((item) => !item.closest('#uutix-helper-panel'));
+    const selectedSession = getSelectedSessionWrap();
+    const priceWraps = getPriceWraps(getPriceList());
+    const targets = readTargetsFromPanel();
+    const cashierParams = new URLSearchParams(location.search || '');
+    const cashierQueryKeys = Array.from(cashierParams.keys()).filter(Boolean);
+
+    return {
+      capturedAt: new Date().toISOString(),
+      page: {
+        host: location.host,
+        path: location.pathname,
+        url: redactUrl(location.href),
+        title: document.title || ''
+      },
+      ids: {
+        projectId: getUrlParamValue(['pId', 'projectId']),
+        performanceId: getUrlParamValue(['performance_id', 'performanceId']),
+        selectedShowId: parseShowIdFromWrap(selectedSession),
+        selectedTicketId: parseTicketIdFromWrap(getSelectedTicketWrap()),
+        orderIdInUrl: getUrlParamValue(['orderId', 'orderid'])
+      },
+      target: {
+        sessionPosition: targets.sessionPosition,
+        pricePosition: targets.pricePosition,
+        quantity: targets.quantity,
+        paymentMethod: targets.paymentMethod,
+        rushReturn: targets.rushReturn,
+        rushIntervalMs: targets.rushIntervalMs
+      },
+      sessions: sessionItems.slice(0, 50).map((item, index) => {
+        const wrap = item.closest('.item-wrap') || item;
+        return {
+          position: index + 1,
+          showId: parseShowIdFromWrap(wrap),
+          text: getText(wrap),
+          selected: wrap === selectedSession || wrap.contains(selectedSession)
+        };
+      }),
+      tickets: priceWraps.slice(0, 80).map(extractTicketWrapState),
+      quantity: {
+        current: getQuantityNumber(),
+        limit: getTicketLimit()
+      },
+      cashier: isCashierPaymentPage() ? {
+        queryKeys: cashierQueryKeys,
+        hasPayToken: cashierParams.has('payToken') || cashierParams.has('paytoken'),
+        hasTradeNo: cashierParams.has('tradeNo') || cashierParams.has('tradeno'),
+        paymentItems: getCashierPaymentItems().map((item) => ({
+          text: getText(item),
+          selected: isCashierPaymentItemSelected(item)
+        }))
+      } : null,
+      recentNetwork: networkRecorder.records.slice(-20)
+    };
+  }
+
+  function extractApiState() {
+    const records = networkRecorder.records.slice(-80);
+    const endpoints = records.map((record) => ({
+      method: record.method,
+      url: record.url,
+      status: record.status,
+      type: record.type
+    }));
+    return {
+      recording: networkRecorder.recording,
+      records: records.length,
+      endpoints
+    };
+  }
+
+  function matchTarget(pageState = extractPageState()) {
+    const target = pageState.target;
+    const targetSession = pageState.sessions.find((item) => item.position === target.sessionPosition) || null;
+    const targetTicket = pageState.tickets.find((item) => item.position === target.pricePosition) || null;
+    const quantityOk = !pageState.quantity.limit || target.quantity <= pageState.quantity.limit;
+    return {
+      matched: !!targetTicket && quantityOk,
+      targetSession,
+      targetTicket,
+      quantityOk,
+      notes: [
+        targetSession ? null : '当前页面未能确认目标场次',
+        targetTicket ? null : '当前页面未能确认目标票档',
+        quantityOk ? null : `目标数量超过页面限购 ${pageState.quantity.limit}`
+      ].filter(Boolean)
+    };
+  }
+
+  function buildPurchaseCandidate() {
+    const pageState = extractPageState();
+    const apiState = extractApiState();
+    const matched = matchTarget(pageState);
+    return {
+      mode: 'dry-run-only',
+      willSendRequest: false,
+      canBuildCreateOrderRequest: false,
+      reason: '当前脚本只构造候选信息；建单接口已知但含 mygsig/Rohr fingerprint 等动态参数，必须由页面原生流程生成，脚本不手工直发。',
+      missingFields: [
+        '页面当前流程生成的 mygsig',
+        'Rohr 风控生成的 cart/order fingerprint',
+        '失败码、验证码、限流分支的实际返回',
+        'cashier submitPay 的 x-csrf-token 与支付页 fingerprint'
+      ],
+      pageState,
+      apiState,
+      matched
+    };
+  }
+
+  function dryRunPurchase() {
+    const candidate = buildPurchaseCandidate();
+    logDebug('Dry Run：候选购票参数（不会发送创建订单请求）', candidate);
+    try {
+      console.table({
+        page: `${candidate.pageState.page.host}${candidate.pageState.page.path}`,
+        projectId: candidate.pageState.ids.projectId || '',
+        showId: candidate.pageState.ids.selectedShowId || '',
+        ticketId: candidate.pageState.ids.selectedTicketId || '',
+        targetSession: candidate.pageState.target.sessionPosition,
+        targetTicket: candidate.pageState.target.pricePosition,
+        quantity: candidate.pageState.target.quantity,
+        matched: candidate.matched.matched
+      });
+    } catch (_) {}
+    updateStatus('Dry Run 已输出到控制台；未发送创建订单请求', '#17a2b8');
+    return candidate;
+  }
+
+  function feasibilityReport() {
+    const candidate = buildPurchaseCandidate();
+    const hasCreateLikeRecord = networkRecorder.records.some((record) =>
+      /order|trade|cart|submit|lock|ticket/i.test(record.url) &&
+      String(record.method || '').toUpperCase() === 'POST'
+    );
+    const report = {
+      conclusion: hasCreateLikeRecord
+        ? '发现疑似状态改变请求，请结合导出的日志继续人工核对。'
+        : '当前页面/日志尚未捕获创建订单或锁票接口，暂不建议直接 API 下单。',
+      recommendedMode: hasCreateLikeRecord ? 'API 识别 + 页面点击混合方案' : '先记录真实购票链路，再做 API 识别 + 页面点击混合方案',
+      dryRunCandidate: candidate
+    };
+    logDebug('API 可行性报告（页面内原型）', report);
+    return report;
+  }
+
   function setAutoRunFlag(enabled) {
     try {
       if (enabled) localStorage.setItem(AUTO_RUN_KEY, '1');
@@ -2535,6 +2980,13 @@
         <button id="stop-btn" style="flex:1; background:#dc3545; color:#fff;">停止</button>
       </div>
 
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
+        <button id="network-start-btn" type="button" style="background:#17a2b8; color:#fff;">记录请求</button>
+        <button id="network-stop-btn" type="button" style="background:#6c757d; color:#fff;">停止记录</button>
+        <button id="network-export-btn" type="button" style="background:#007bff; color:#fff;">导出日志</button>
+        <button id="dry-run-btn" type="button" style="background:#ffc107; color:#222;">Dry Run</button>
+      </div>
+
       <div id="status-display">状态: 准备就绪</div>
     `;
 
@@ -2551,6 +3003,13 @@
 
     document.getElementById('start-btn').onclick = startMonitoring;
     document.getElementById('stop-btn').onclick = () => stopMonitoring(false);
+    document.getElementById('network-start-btn').onclick = startNetworkRecording;
+    document.getElementById('network-stop-btn').onclick = stopNetworkRecording;
+    document.getElementById('network-export-btn').onclick = exportNetworkRecords;
+    document.getElementById('dry-run-btn').onclick = () => {
+      dryRunPurchase();
+      feasibilityReport();
+    };
     document.getElementById('uutix-helper-hide').onclick = () => setPanelHidden(panel, dock, true);
     document.getElementById('rush-return-toggle').onclick = () => {
       const enabled = document.getElementById('rush-return-toggle')?.dataset?.enabled === '1';
