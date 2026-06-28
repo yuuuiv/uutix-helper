@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         UUTIX Helper (v19 API)
 // @namespace    http://tampermonkey.net/
-// @version      2026-06-27.19-api
+// @version      2026-06-28.19-api
 // @description  v18 DOM 续跑 + API 快路径：用接口完成选票、加购、建单、pay/token，失败时回退页面流程；不保存账号密码或卡号。
 // @author       yuuuiv
 // @license      MIT
@@ -25,6 +25,9 @@
 
   let submitIntervalId = null;
   let entryObserver = null;
+  let entryClockTimer = null;
+  let entryClockLastSample = null;
+  let entryClockLastFetchAt = 0;
   let domSignalObserver = null;
   let domSignalVersion = 0;
   const domSignalWaiters = new Set();
@@ -105,11 +108,12 @@
       all: initial; position: fixed; top: 120px; right: 20px; z-index: 99999;
       background:#fff; border:1px solid #e0e0e0; border-radius:12px; padding:18px;
       font-family:sans-serif; box-shadow:0 4px 12px rgba(0,0,0,.15);
-      display:flex; flex-direction:column; gap:12px; width:360px; box-sizing:border-box;
+      display:flex; flex-direction:column; gap:12px; width:360px; max-height:calc(100vh - 24px);
+      overflow-y:auto; overscroll-behavior:contain; box-sizing:border-box;
     }
     #uutix-helper-panel button{ cursor:pointer; padding:8px; border-radius:6px; border:none; font-weight:bold; }
     #uutix-helper-panel label, #uutix-helper-panel span, #uutix-helper-panel div{ box-sizing:border-box; font-family:sans-serif; }
-    #uutix-helper-header{ display:flex; align-items:center; justify-content:space-between; cursor:move; user-select:none; }
+    #uutix-helper-header{ display:flex; align-items:center; justify-content:space-between; cursor:move; user-select:none; touch-action:none; }
     #uutix-helper-title{ font-weight:bold; font-size:16px; line-height:24px; }
     #uutix-helper-hide{ width:52px; background:#6c757d; color:#fff; padding:6px 8px !important; font-size:12px; }
     #uutix-helper-dock{
@@ -119,6 +123,22 @@
       cursor:pointer; display:none; user-select:none;
     }
     #status-display{ font-size:13px; padding:8px; text-align:center; border-radius:8px; background:#f5f5f5; }
+    #clock-display{ font-size:12px; line-height:1.45; padding:7px 8px; text-align:left; border-radius:8px; background:#f8f9fa; color:#6c757d; white-space:pre-line; }
+    #calibrate-clock-btn{ background:#6c757d; color:#fff; font-size:12px; padding:6px 8px !important; font-weight:600 !important; }
+    #uutix-helper-panel .uutix-row{ display:flex; justify-content:space-between; align-items:center; gap:8px; }
+    #uutix-helper-panel .uutix-row span{ font-size:13px; white-space:nowrap; }
+    #uutix-helper-panel .uutix-control{ width:140px; border:1px solid #ccc; }
+    #uutix-helper-panel .uutix-actions{ display:flex; gap:10px; }
+    #uutix-helper-panel .uutix-actions button{ flex:1; }
+    #uutix-helper-panel .uutix-options{ display:grid; grid-template-columns:1fr 1fr; gap:6px; font-size:12px; }
+    #uutix-helper-panel .uutix-details{
+      border:1px solid #eee; border-radius:8px; background:#fafafa; padding:0 9px;
+    }
+    #uutix-helper-panel .uutix-details > summary{
+      cursor:pointer; font:700 12px sans-serif; padding:8px 0; color:#495057; user-select:none;
+    }
+    #uutix-helper-panel .uutix-details[open]{ padding-bottom:9px; }
+    #uutix-helper-panel .uutix-details .uutix-row{ margin-top:8px; }
     #uutix-helper-panel input, #uutix-helper-panel select{
       font-size:13px; padding:2px 6px; border-radius:4px; outline:none;
       border:1px solid #ccc; background:#fff; box-sizing:border-box;
@@ -131,6 +151,34 @@
     #uutix-card-fields .uutix-row span{ font-size:12px; white-space:nowrap; }
     #uutix-card-fields input{ width:190px; }
     #uutix-card-privacy{ font-size:11px; line-height:1.45; color:#6c757d; }
+    @media (max-width: 520px), (max-height: 720px) {
+      #uutix-helper-panel{
+        top:8px !important; left:8px !important; right:8px !important; bottom:auto !important;
+        width:calc(100vw - 16px) !important; max-height:58vh !important;
+        padding:10px !important; gap:8px !important; border-radius:10px !important;
+        -webkit-overflow-scrolling:touch;
+      }
+      #uutix-helper-header{
+        position:sticky; top:-10px; z-index:1; background:#fff; padding-bottom:4px;
+      }
+      #uutix-helper-title{ font-size:15px; }
+      #uutix-helper-title::after{ content:" · 紧凑"; color:#6c757d; font-size:12px; font-weight:400; }
+      #uutix-helper-hide{ width:46px; padding:5px 7px !important; }
+      #uutix-helper-panel .uutix-row{ min-height:28px; }
+      #uutix-helper-panel .uutix-row span{ font-size:12px; }
+      #uutix-helper-panel .uutix-control{ width:122px !important; }
+      #uutix-helper-panel input, #uutix-helper-panel select{ height:28px; font-size:12px; }
+      #uutix-helper-panel button{ padding:7px !important; }
+      #uutix-helper-panel .uutix-actions{
+        position:sticky; bottom:-10px; z-index:1; background:#fff; padding-top:4px;
+      }
+      #status-display{ font-size:12px; padding:6px; }
+      #clock-display{ font-size:11px; line-height:1.35; max-height:86px; overflow:auto; }
+      #calibrate-clock-btn{ font-size:11px; }
+      #uutix-card-fields{ gap:6px; padding:8px; }
+      #uutix-card-fields input{ width:160px !important; }
+      #uutix-helper-dock{ right:10px; bottom:92px; }
+    }
   `);
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -251,6 +299,36 @@
       s.textContent = `状态: ${msg}`;
       s.style.color = color;
     }
+  }
+
+  function updateClockDisplay(msg, color = '#6c757d') {
+    const s = document.getElementById('clock-display');
+    if (s) {
+      s.textContent = `${msg}`;
+      s.style.color = color;
+    }
+  }
+
+  function formatSignedMs(ms) {
+    if (!Number.isFinite(ms)) return '未知';
+    const sign = ms >= 0 ? '+' : '-';
+    const abs = Math.abs(ms);
+    if (abs >= 1000) return `${sign}${(abs / 1000).toFixed(abs >= 10000 ? 1 : 3)}s`;
+    return `${sign}${Math.round(abs)}ms`;
+  }
+
+  function formatDurationShort(ms) {
+    if (!Number.isFinite(ms) || ms < 0) return '未知';
+    if (ms < 1000) return `${Math.round(ms)}ms`;
+    if (ms < 60000) return `${Math.floor(ms / 1000)}s`;
+    return `${Math.floor(ms / 60000)}m${Math.floor((ms % 60000) / 1000)}s`;
+  }
+
+  function getClockSkewColor(ms) {
+    const abs = Math.abs(Number(ms) || 0);
+    if (abs <= 500) return '#28a745';
+    if (abs <= 2000) return '#ff9800';
+    return '#dc3545';
   }
 
   function safeJsonParse(text) {
@@ -759,6 +837,11 @@
       try { entryObserver.disconnect(); } catch (_) {}
       entryObserver = null;
     }
+  }
+
+  function clearEntryClockMonitor() {
+    if (entryClockTimer) clearInterval(entryClockTimer);
+    entryClockTimer = null;
   }
 
   function signalDomChanged() {
@@ -2033,6 +2116,7 @@
   );
 
   updateStatus('等待入口按钮变为购买状态...', '#17a2b8');
+  startEntryClockMonitor(token);
 
   let clickTimer = null;
 
@@ -2114,6 +2198,7 @@
   );
 
   clearEntryObserver();
+  clearEntryClockMonitor();
   clearCrowdRetryFlag();
   return true;
 }
@@ -2459,6 +2544,144 @@
       if (value) return value;
     }
     return null;
+  }
+
+  async function fetchDetailClockSnapshot(projectId) {
+    if (!projectId) throw new Error('缺少 pId，无法校准详情页倒计时');
+
+    const url = new URL('/api/oversea/project/detail', location.origin);
+    url.searchParams.set('bizId', String(projectId));
+    url.searchParams.set('source', '0');
+    url.searchParams.set('t', String(Date.now()));
+    url.searchParams.set('WuKongReady', 'h5');
+
+    const headers = {
+      accept: 'application/json, text/plain, */*',
+      language: 'zh-HK',
+      clientplatform: '1',
+      sellchannel: '23',
+      'cache-control': 'no-cache'
+    };
+    const uuid = getRuntimeUuid();
+    if (uuid) headers.uuid = uuid;
+
+    const t0 = Date.now();
+    const response = await pageWindow.fetch(url.toString(), {
+      method: 'GET',
+      credentials: 'include',
+      cache: 'no-store',
+      headers
+    });
+    const text = await response.text();
+    const t1 = Date.now();
+    const json = safeJsonParse(text);
+    captureApiSnapshot({ url: url.toString(), responseBody: text });
+    if (!response.ok) throw new Error(`/api/oversea/project/detail HTTP ${response.status}`);
+    if (!json) throw new Error('/api/oversea/project/detail 未返回 JSON');
+    const code = json.code ?? json.statusCode ?? json.errno;
+    const ok = json.success === true || code === 200 || code === 0 || code == null;
+    if (!ok) throw new Error(getApiErrorMessage('/api/oversea/project/detail', json));
+
+    const rttMs = Math.max(0, t1 - t0);
+    const midpointMs = Math.round((t0 + t1) / 2);
+    const serverTime = Number(json?.attrMaps?.serverTime);
+    const httpDate = response.headers.get('date') || '';
+    const httpDateMs = httpDate ? Date.parse(httpDate) : NaN;
+    const saleRemindModel = json?.data?.saleRemindModel || {};
+    const onSaleTime = Number(saleRemindModel.onSaleTime || 0);
+
+    return {
+      projectId: String(projectId),
+      capturedAt: t1,
+      rttMs,
+      serverTime,
+      httpDateMs,
+      httpDate,
+      onSaleTime,
+      uutixServerVsBrowserMs: Number.isFinite(serverTime) ? serverTime - midpointMs : NaN,
+      httpDateVsBrowserMs: Number.isFinite(httpDateMs) ? httpDateMs - midpointMs : NaN,
+      uutixServerVsHttpDateMs: Number.isFinite(serverTime) && Number.isFinite(httpDateMs) ? serverTime - httpDateMs : NaN
+    };
+  }
+
+  function renderClockSnapshot(sample) {
+    if (!sample) return { text: '未校准', color: '#6c757d' };
+    const primaryMs = Number.isFinite(sample.uutixServerVsHttpDateMs)
+      ? sample.uutixServerVsHttpDateMs
+      : sample.uutixServerVsBrowserMs;
+    const primaryLabel = Number.isFinite(sample.uutixServerVsHttpDateMs) ? 'HTTP Date' : '本机';
+    if (!Number.isFinite(primaryMs)) {
+      return { text: '已请求详情接口，但未读到 serverTime/Date 头', color: '#ff9800' };
+    }
+    const ageMs = Date.now() - sample.capturedAt;
+    const direction = primaryMs >= 0 ? '快' : '慢';
+    const abs = Math.abs(primaryMs);
+    let advice = '正常，无需刷新';
+    if (ageMs > 5 * 60 * 1000) {
+      advice = '校准较久，建议开抢前手动校准一次';
+    } else if (abs > 2000) {
+      advice = '偏差较大，先手动校准；仍偏大再刷新详情页';
+    } else if (abs > 500) {
+      advice = '轻微偏差，开抢前可手动校准一次';
+    }
+
+    const lines = [
+      `网页倒计时：比${primaryLabel}${direction} ${formatSignedMs(primaryMs).replace(/^[+-]/, '')}`,
+      `建议：${advice}`,
+      `参考：UUTIX-本机 ${formatSignedMs(sample.uutixServerVsBrowserMs)}${Number.isFinite(sample.httpDateVsBrowserMs) ? `；Date-本机 ${formatSignedMs(sample.httpDateVsBrowserMs)}` : ''}`,
+      `网络：RTT ${Math.round(sample.rttMs)}ms；校准 ${formatDurationShort(ageMs)} 前`
+    ];
+    return { text: lines.join('\n'), color: getClockSkewColor(primaryMs) };
+  }
+
+  async function refreshDetailClockDisplay({ force = false } = {}) {
+    const projectId = getUrlParamValue(['pId', 'projectId']) || extractPageState().ids.projectId;
+    if (!projectId) {
+      updateClockDisplay('当前页无 pId，无法比较详情页倒计时', '#6c757d');
+      return null;
+    }
+
+    // 非强制刷新只用上一次校准结果本地推算，避免频繁打 project/detail。
+    if (!force && entryClockLastSample && String(entryClockLastSample.projectId || '') === String(projectId)) {
+      const rendered = renderClockSnapshot(entryClockLastSample);
+      updateClockDisplay(rendered.text, rendered.color);
+      return entryClockLastSample;
+    }
+
+    // 自动校准失败时至少间隔 60s；手动按钮不受限制。
+    if (!force && Date.now() - entryClockLastFetchAt < 60000) {
+      updateClockDisplay('等待手动校准或自动冷却结束...', '#6c757d');
+      return null;
+    }
+
+    try {
+      entryClockLastFetchAt = Date.now();
+      updateClockDisplay('正在校准 UUTIX serverTime...', '#17a2b8');
+      const sample = await fetchDetailClockSnapshot(projectId);
+      entryClockLastSample = sample;
+      const rendered = renderClockSnapshot(sample);
+      updateClockDisplay(rendered.text, rendered.color);
+      return sample;
+    } catch (e) {
+      updateClockDisplay(`校准失败：${e?.message || e}`, '#ff9800');
+      return null;
+    }
+  }
+
+  function startEntryClockMonitor(token) {
+    clearEntryClockMonitor();
+    const projectId = getUrlParamValue(['pId', 'projectId']) || extractPageState().ids.projectId;
+    const needFresh = !entryClockLastSample ||
+      String(entryClockLastSample.projectId || '') !== String(projectId || '') ||
+      Date.now() - entryClockLastSample.capturedAt > 5 * 60 * 1000;
+    refreshDetailClockDisplay({ force: needFresh });
+    entryClockTimer = setInterval(() => {
+      if (!isRunning || token !== runToken) {
+        clearEntryClockMonitor();
+        return;
+      }
+      refreshDetailClockDisplay();
+    }, 1000);
   }
 
   function extractTicketWrapState(wrap, index) {
@@ -3996,6 +4219,7 @@
   function stopMonitoring(keepStatus) {
     clearSubmitInterval();
     clearEntryObserver();
+    clearEntryClockMonitor();
     setAutoRunFlag(false);
     setCartSubmitFlag(false);
     setPayNowFlag(false);
@@ -4198,34 +4422,24 @@
         <button id="uutix-helper-hide" type="button">隐藏</button>
       </div>
 
-      <div style="display:flex; justify-content:space-between; align-items:center;">
+      <div class="uutix-row">
         <span style="font-size:13px;">场次位置:</span>
-        <input type="number" id="session-position" value="1" min="1" style="width:140px; border:1px solid #ccc;">
+        <input class="uutix-control" type="number" id="session-position" value="1" min="1">
       </div>
 
-      <div style="display:flex; justify-content:space-between; align-items:center;">
+      <div class="uutix-row">
         <span style="font-size:13px;">票价位置:</span>
-        <input type="number" id="price-position" value="1" min="1" style="width:140px; border:1px solid #ccc;">
+        <input class="uutix-control" type="number" id="price-position" value="1" min="1">
       </div>
 
-      <div style="display:flex; justify-content:space-between; align-items:center;">
+      <div class="uutix-row">
         <span style="font-size:13px;">目标数量:</span>
-        <input type="number" id="ticket-quantity" value="1" min="1" style="width:140px; border:1px solid #ccc;">
+        <input class="uutix-control" type="number" id="ticket-quantity" value="1" min="1">
       </div>
 
-      <div style="display:flex; justify-content:space-between; align-items:center;">
-        <span style="font-size:13px;">是否抢回流:</span>
-        <button id="rush-return-toggle" type="button" data-enabled="0" style="width:140px; background:#6c757d; color:#fff;">抢回流：关</button>
-      </div>
-
-      <div style="display:flex; justify-content:space-between; align-items:center;">
-        <span style="font-size:13px;">回流间隔(ms):</span>
-        <input type="number" id="rush-return-interval" value="${RUSH_RETURN_INTERVAL_DEFAULT_MS}" min="${RUSH_RETURN_INTERVAL_MIN_MS}" max="${RUSH_RETURN_INTERVAL_MAX_MS}" step="10" style="width:140px; border:1px solid #ccc;">
-      </div>
-
-      <div style="display:flex; justify-content:space-between; align-items:center;">
+      <div class="uutix-row">
         <span style="font-size:13px;">支付方式:</span>
-        <select id="payment-method" style="width:140px;">
+        <select class="uutix-control" id="payment-method">
           <option value="wechat">微信支付</option>
           <option value="alipayhk">AlipayHK</option>
           <option value="visa">VISA卡</option>
@@ -4235,9 +4449,22 @@
         </select>
       </div>
 
-      <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px; font-size:12px;">
+      <div class="uutix-options">
         <label><input type="checkbox" id="api-fast-path-enabled" checked> API快路径</label>
       </div>
+
+      <details class="uutix-details">
+        <summary>高级设置 / 抢回流</summary>
+        <div class="uutix-row">
+          <span style="font-size:13px;">是否抢回流:</span>
+          <button class="uutix-control" id="rush-return-toggle" type="button" data-enabled="0" style="background:#6c757d; color:#fff;">抢回流：关</button>
+        </div>
+
+        <div class="uutix-row">
+          <span style="font-size:13px;">回流间隔(ms):</span>
+          <input class="uutix-control" type="number" id="rush-return-interval" value="${RUSH_RETURN_INTERVAL_DEFAULT_MS}" min="${RUSH_RETURN_INTERVAL_MIN_MS}" max="${RUSH_RETURN_INTERVAL_MAX_MS}" step="10">
+        </div>
+      </details>
 
       <div id="uutix-card-fields">
         <div class="uutix-row">
@@ -4259,12 +4486,18 @@
         <div id="uutix-card-privacy">卡号、CVV、有效期、持卡人不会写入 localStorage，也不会被脚本长期保存；仅在当前标签页临时传递给支付页，读取后清除。</div>
       </div>
 
-      <div style="display:flex; gap:10px;">
+      <div class="uutix-actions">
         <button id="start-btn" style="flex:1; background:#28a745; color:#fff;">开始</button>
         <button id="stop-btn" style="flex:1; background:#dc3545; color:#fff;">停止</button>
       </div>
 
       <div id="status-display">状态: 准备就绪</div>
+
+      <details class="uutix-details">
+        <summary>时钟校准</summary>
+        <div id="clock-display">时钟: 等待进入详情页校准</div>
+        <button id="calibrate-clock-btn">手动校准时钟</button>
+      </details>
     `;
 
     const dock = document.createElement('div');
@@ -4285,6 +4518,7 @@
 
     document.getElementById('start-btn').onclick = startMonitoring;
     document.getElementById('stop-btn').onclick = () => stopMonitoring(false);
+    document.getElementById('calibrate-clock-btn').onclick = () => refreshDetailClockDisplay({ force: true });
     document.getElementById('uutix-helper-hide').onclick = () => setPanelHidden(panel, dock, true);
     document.getElementById('rush-return-toggle').onclick = () => {
       const enabled = document.getElementById('rush-return-toggle')?.dataset?.enabled === '1';
@@ -4320,6 +4554,10 @@
       try { return localStorage.getItem(PANEL_HIDDEN_KEY) === '1'; } catch (_) { return false; }
     })();
     setPanelHidden(panel, dock, isHidden, false);
+
+    if (/\/detail/i.test(location.pathname) && getUrlParamValue(['pId', 'projectId'])) {
+      setTimeout(() => refreshDetailClockDisplay({ force: true }), 300);
+    }
 
     if (shouldAutoHandleCrowdPage()) {
       scheduleAutoStart(
