@@ -18,6 +18,8 @@
 // @grant        GM_deleteValue
 // @grant        unsafeWindow
 // @run-at       document-start
+// @downloadURL  https://raw.githubusercontent.com/yuuuiv/uutix-helper/main/UUTIX%20Helper%20(v19).js
+// @updateURL    https://raw.githubusercontent.com/yuuuiv/uutix-helper/main/UUTIX%20Helper%20(v19).js
 // ==/UserScript==
 
 (function () {
@@ -3820,7 +3822,6 @@
   }
 
   async function executeApiFastPurchaseSequence(token) {
-    const originalUrl = location.href;
     try {
       await ensureNotStopped(token);
       const target = readTargetsFromPanel();
@@ -3881,10 +3882,6 @@
         }
       }
 
-      try {
-        if (cartId) history.replaceState(history.state, document.title, `/shopping-cart?shoppingCartId=${encodeURIComponent(cartId)}&pId=${encodeURIComponent(effectiveProjectId)}`);
-      } catch (_) {}
-
       if (!orderId) {
         updateStatus('API快路径：读取购物车明细...', '#007bff');
         const detailJson = await apiFetchJson('/api/oversea/shoppingCart/detail', {
@@ -3893,10 +3890,6 @@
         const detailProjectId = detailJson?.data?.showInfoList?.find((item) => item?.projectId)?.projectId;
         if (detailProjectId != null && detailProjectId !== '') effectiveProjectId = String(detailProjectId);
         const userInfo = await getUserInfoFast();
-
-        try {
-          history.replaceState(history.state, document.title, `/trade-confirmation?shoppingCartId=${encodeURIComponent(cartId)}&pId=${encodeURIComponent(effectiveProjectId)}`);
-        } catch (_) {}
 
         updateStatus('API快路径：创建订单...', '#007bff');
         const createJson = await apiFetchJson('/api/oversea/order/createV3', {
@@ -3949,9 +3942,6 @@
       location.href = cashierUrl;
       return true;
     } catch (e) {
-      try {
-        if (location.origin === new URL(originalUrl).origin) history.replaceState(history.state, document.title, originalUrl);
-      } catch (_) {}
       throw e;
     }
   }
